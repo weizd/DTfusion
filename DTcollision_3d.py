@@ -46,12 +46,12 @@ k0 = [1.0, 0.0, 0.0]   # 平面波方向
 
 def analytic_solution_3d(x, t, x0 = [0.0, 0.0, 0.0], delta = 0.5, k0 = [1.0, 0.0, 0.0]):
     """
-    x: numpy array of shape (N,3), 每行是 [x,y,z]
+    x: numpy array of shape (N,4), 每行是 [x,y,z,t]
     t: 标量或长度为 N 的数组
-    返回：复数 numpy 数组 shape (N,)
+    返回：复数 numpy 数组 shape (N,t)
     """
     m = 1.0
-    x = np.asarray(x)
+    x = np.asarray(x).reshape(-1,1)
     t = np.asarray(t).reshape(-1,1)
     k0 = np.array(k0)
     sigma2 = (delta + 1j * t / (2*m*delta))**2
@@ -98,36 +98,85 @@ data = dde.data.TimePDE(
     space_time,
     schrodinger_pde_3d,
     [ic_real, ic_imag, bc_real, bc_imag],
-    num_domain=2000,        # 域内残差点
-    num_boundary=500,       # 边界点
-    num_initial=500,        # 初始时刻点
-    train_distribution="pseudo",)
+    num_domain=200,        # 域内残差点
+    num_boundary=50,       # 边界点
+    num_initial=50,        # 初始时刻点
+    train_distribution="pseudo")
 
 model = dde.Model(data, net)
 model.compile("adam", lr=1e-3, loss="MSE")
-model.train(epochs=100000)
-model.compile("L-BFGS")
-model.train()
+model.train(epochs=10)
+# model.compile("L-BFGS")
+# model.train()
 
-# 选取 t_test 时间和 y=z=0 截面
-t_test = 0.5
+# # 选取 t_test 时间和 y=z=0 截面
+# t_test = 0.5
+# N = 200
+# x_line = np.linspace(-5, 5, N)
+# xyz = np.vstack([x_line, np.zeros(N), np.zeros(N)]).T
+#
+# # PINN 预测
+# X_test = np.hstack([xyz, t_test*np.ones((N,1))])
+# y_pred = model.predict(X_test)                          # 输出 (N,2)
+# psi_pinn = y_pred[:,0] + 1j*y_pred[:,1]
+#
+# # 解析解
+# psi_exact = analytic_solution_3d(xyz, t_test)
+#
+# # 绘图对比
+# plt.figure(figsize=(8,4))
+# plt.plot(x_line, psi_exact.real, '--', label='Analytic Real')
+# plt.plot(x_line, psi_pinn.real,  '-', label='PINN Real')
+# plt.plot(x_line, psi_exact.imag, '--', label='Analytic Imag')
+# plt.plot(x_line, psi_pinn.imag,  '-', label='PINN Imag')
+# plt.xlabel('x') ; plt.ylabel(r'$\psi$') ; plt.title(f'Wavefunction slice at y=z=0, t={t_test}')
+# plt.legend(); plt.tight_layout(); plt.show()
+
+
+# 定义空间和时间范围
 N = 200
-x_line = np.linspace(-5, 5, N)
-xyz = np.vstack([x_line, np.zeros(N), np.zeros(N)]).T
+x = np.linspace(-5, 5, N)
+t = np.linspace(0, 1, N).reshape(-1, 1)
+xyz = np.stack([x, np.zeros(N), np.zeros(N)]).T
 
 # PINN 预测
-X_test = np.hstack([xyz, t_test*np.ones((N,1))])
-y_pred = model.predict(X_test)                          # 输出 (N,2)
-psi_pinn = y_pred[:,0] + 1j*y_pred[:,1]
+X_test = np.hstack([xyz, t])
+y_pred = model.predict(X_test)
+psi_pinn = y_pred[:, 0] + 1j * y_pred[:, 1]
+psi_pinn = psi_pinn.reshape(t.shape)
 
 # 解析解
-psi_exact = analytic_solution_3d(xyz, t_test)
+psi_exact = analytic_solution_3d(x, t)
+psi_exact = psi_exact.reshape(t.shape)
 
-# 绘图对比
-plt.figure(figsize=(8,4))
-plt.plot(x_line, psi_exact.real, '--', label='Analytic Real')
-plt.plot(x_line, psi_pinn.real,  '-', label='PINN Real')
-plt.plot(x_line, psi_exact.imag, '--', label='Analytic Imag')
-plt.plot(x_line, psi_pinn.imag,  '-', label='PINN Imag')
-plt.xlabel('x') ; plt.ylabel(r'$\psi$') ; plt.title(f'Wavefunction slice at y=z=0, t={t_test}')
-plt.legend(); plt.tight_layout(); plt.show()
+# 计算实部、虚部和振幅的差异
+real_diff = np.real(psi_pinn - psi_exact)
+imag_diff = np.imag(psi_pinn - psi_exact)
+amp_diff = np.abs(psi_pinn) - np.abs(psi_exact)
+
+# 绘制差异图像
+fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+
+im1 = axes[0].imshow(real_diff, extent=[x.min(), x.max(), t.min(), t.max()],
+                     aspect='auto', origin='lower', cmap='seismic')
+axes[0].set_title('Real Part Difference')
+axes[0].set_xlabel('x')
+axes[0].set_ylabel('t')
+fig.colorbar(im1, ax=axes[0])
+
+im2 = axes[1].imshow(imag_diff, extent=[x.min(), x.max(), t.min(), t.max()],
+                     aspect='auto', origin='lower', cmap='seismic')
+axes[1].set_title('Imaginary Part Difference')
+axes[1].set_xlabel('x')
+axes[1].set_ylabel('t')
+fig.colorbar(im2, ax=axes[1])
+
+im3 = axes[2].imshow(amp_diff, extent=[x.min(), x.max(), t.min(), t.max()],
+                     aspect='auto', origin='lower', cmap='viridis')
+axes[2].set_title('Amplitude Difference')
+axes[2].set_xlabel('x')
+axes[2].set_ylabel('t')
+fig.colorbar(im3, ax=axes[2])
+
+plt.tight_layout()
+plt.show()
