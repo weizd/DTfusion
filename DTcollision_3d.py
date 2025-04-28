@@ -68,7 +68,7 @@ def analytic_solution_3d(x, t, x0 = [0.0, 0.0, 0.0], delta = 0.5, k0 = [1.0, 0.0
     return (norm * phase).flatten()
 
 def initial_wave_3d(x):
-    # x: (N,4)，其中 x[:,0:3] 是 [x,y,z]，x[:,3] = 0 且 t=0
+    # x: (N,4)，其中 x[:,0:3] 是 [x,y,z]，x[:,3] = t
     X = x[:, 0:3]
     # 计算空间偏移和高斯衰减
     diff = X - np.array(x0)
@@ -106,6 +106,9 @@ data = dde.data.TimePDE(
 model = dde.Model(data, net)
 model.compile("adam", lr=1e-3, loss="MSE")
 model.train(epochs=10)
+losshistory, train_state = model.train(epochs=10, iterations=20, batch_size=10)
+dde.saveplot(losshistory, train_state, issave=False, isplot=True)
+
 # model.compile("L-BFGS")
 # model.train()
 
