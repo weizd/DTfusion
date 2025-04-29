@@ -1,6 +1,7 @@
 import deepxde as dde
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.gridspec import GridSpec
 
 # 物理参数
 m = 1.0
@@ -46,13 +47,13 @@ k0 = [1.0, 0.0, 0.0]   # 平面波方向
 
 def analytic_solution_3d(x, t, x0 = [0.0, 0.0, 0.0], delta = 0.5, k0 = [1.0, 0.0, 0.0]):
     """
-    x: numpy array of shape (N,4), 每行是 [x,y,z,t]
+    x: numpy array of shape (N,3), 每行是 [x,y,z]
     t: 标量或长度为 N 的数组
     返回：复数 numpy 数组 shape (N,t)
     """
     m = 1.0
-    x = np.asarray(x).reshape(-1,1)
-    t = np.asarray(t).reshape(-1,1)
+    x = x[:, 0].reshape(-1, 1)
+    t = np.array(t)
     k0 = np.array(k0)
     sigma2 = (delta + 1j * t / (2*m*delta))**2
     norm = (2*np.pi*sigma2)**(-3/4)
@@ -101,11 +102,11 @@ data = dde.data.TimePDE(
     num_domain=200,        # 域内残差点
     num_boundary=50,       # 边界点
     num_initial=50,        # 初始时刻点
+    num_test=100,
     train_distribution="pseudo")
 
 model = dde.Model(data, net)
 model.compile("adam", lr=1e-3, loss="MSE")
-model.train(epochs=10)
 losshistory, train_state = model.train(epochs=10, iterations=20, batch_size=10)
 dde.saveplot(losshistory, train_state, issave=False, isplot=True)
 
@@ -135,51 +136,53 @@ dde.saveplot(losshistory, train_state, issave=False, isplot=True)
 # plt.xlabel('x') ; plt.ylabel(r'$\psi$') ; plt.title(f'Wavefunction slice at y=z=0, t={t_test}')
 # plt.legend(); plt.tight_layout(); plt.show()
 
+real_diffs = []
+imag_diffs = []
+amp_diffs = []
 
 # 定义空间和时间范围
 N = 200
 x = np.linspace(-5, 5, N)
-t = np.linspace(0, 1, N).reshape(-1, 1)
-xyz = np.stack([x, np.zeros(N), np.zeros(N)]).T
+t_values = np.linspace(0, 1, N)  # 所有时间点
 
-# PINN 预测
-X_test = np.hstack([xyz, t])
-y_pred = model.predict(X_test)
-psi_pinn = y_pred[:, 0] + 1j * y_pred[:, 1]
-psi_pinn = psi_pinn.reshape(t.shape)
+for t in t_values:
+    t = np.array([[t]])  # 当前时间点
+    xyz = np.stack([x, np.zeros(N), np.zeros(N)]).T
+    X_test = np.hstack([xyz, t.repeat(N, axis=0)])
+    y_pred = model.predict(X_test)
+    psi_pinn = y_pred[:, 0] + 1j * y_pred[:, 1]
+    # psi_pinn = psi_pinn.reshape(-1, 1)
+    psi_exact = analytic_solution_3d(xyz, t)
+    # psi_exact = psi_exact.reshape(-1, 1)  # 确保形状匹配
 
-# 解析解
-psi_exact = analytic_solution_3d(x, t)
-psi_exact = psi_exact.reshape(t.shape)
+    real_diff = np.real(psi_pinn - psi_exact)
+    imag_diff = np.imag(psi_pinn - psi_exact)
+    amp_diff = np.abs(psi_pinn) - np.abs(psi_exact)
 
-# 计算实部、虚部和振幅的差异
-real_diff = np.real(psi_pinn - psi_exact)
-imag_diff = np.imag(psi_pinn - psi_exact)
-amp_diff = np.abs(psi_pinn) - np.abs(psi_exact)
+    real_diffs.append(real_diff)
+    imag_diffs.append(imag_diff)
+    amp_diffs.append(amp_diff)
 
-# 绘制差异图像
-fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+# 将列表转换为NumPy数组
+real_diffs = np.stack(real_diffs, axis=1)  # 每一列代表某个时间点的x切片
+imag_diffs = np.stack(imag_diffs, axis=1)
+amp_diffs = np.stack(amp_diffs, axis=1)
 
-im1 = axes[0].imshow(real_diff, extent=[x.min(), x.max(), t.min(), t.max()],
-                     aspect='auto', origin='lower', cmap='seismic')
-axes[0].set_title('Real Part Difference')
-axes[0].set_xlabel('x')
-axes[0].set_ylabel('t')
-fig.colorbar(im1, ax=axes[0])
+# 绘制热力图
+fig = plt.figure(figsize=(18, 5))
+gs = GridSpec(1, 3, wspace=0.4, hspace=0.4)
 
-im2 = axes[1].imshow(imag_diff, extent=[x.min(), x.max(), t.min(), t.max()],
-                     aspect='auto', origin='lower', cmap='seismic')
-axes[1].set_title('Imaginary Part Difference')
-axes[1].set_xlabel('x')
-axes[1].set_ylabel('t')
-fig.colorbar(im2, ax=axes[1])
+labels = ['Real Part Difference', 'Imaginary Part Difference', 'Amplitude Difference']
+diffs = [real_diffs, imag_diffs, amp_diffs]
+cmaps = ['coolwarm', 'coolwarm', 'plasma']
 
-im3 = axes[2].imshow(amp_diff, extent=[x.min(), x.max(), t.min(), t.max()],
-                     aspect='auto', origin='lower', cmap='viridis')
-axes[2].set_title('Amplitude Difference')
-axes[2].set_xlabel('x')
-axes[2].set_ylabel('t')
-fig.colorbar(im3, ax=axes[2])
+for i in range(3):
+    ax = fig.add_subplot(gs[0, i])
+    im = ax.imshow(diffs[i], extent=[x.min(), x.max(), t_values.min(), t_values.max()],
+                   aspect='auto', origin='lower', cmap=cmaps[i])
+    ax.set_xlabel('Time (t)')
+    ax.set_ylabel('x')
+    ax.set_title(labels[i])
+    plt.colorbar(im, ax=ax)
 
-plt.tight_layout()
 plt.show()
