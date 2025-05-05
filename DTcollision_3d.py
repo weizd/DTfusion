@@ -9,7 +9,6 @@ m = 1.0
 # 空间域：半径为 R 的三维球体
 R = 5.0
 geom = dde.geometry.Hypersphere([0.0, 0.0, 0.0], R)  # 三维球形域，中心在原点，半径 R
-
 # 时间域：t ∈ [0, T]
 T = 1.0
 timedom = dde.geometry.TimeDomain(0.0, T)             # 时间区间
@@ -34,9 +33,9 @@ def schrodinger_pde_3d(x, y):
       + dde.grad.hessian(y, x, i=1, j=1)
       + dde.grad.hessian(y, x, i=1, j=2)
     )
-    # 构造残差(负号？？？)
-    res_r = psi_i_t + (1 / (2*m)) * psi_r_xx
-    res_i = -psi_r_t + (1 / (2*m)) * psi_i_xx
+    # 构造残差
+    res_r = psi_i_t - (1 / (2*m)) * psi_r_xx
+    res_i = -psi_r_t - (1 / (2*m)) * psi_i_xx
     return [res_r, res_i]  # PINN 的 PDE 约束项
 
 
@@ -86,55 +85,53 @@ ic_real = dde.icbc.IC(space_time, lambda x: initial_wave_3d(x)[0], lambda _, on_
 ic_imag = dde.icbc.IC(space_time, lambda x: initial_wave_3d(x)[1], lambda _, on_initial: on_initial)
 
 
-def boundary_sphere(x, on_boundary):
-    # 判断点是否处于球面：||[x,y,z]||≈R 且 on_boundary 为真
-    return on_boundary & np.isclose(np.linalg.norm(x[0:3]), R)
 
-bc_real = dde.DirichletBC(space_time, lambda x: 0.0, boundary_sphere, component=0)
-bc_imag = dde.DirichletBC(space_time, lambda x: 0.0, boundary_sphere, component=1)
-# 强制 ψ_r=0, ψ_i=0 于球面上
 
 net = dde.maps.FNN([4] + [50]*4 + [2], "tanh", "Glorot uniform")  # 输入 4 维
 data = dde.data.TimePDE(
     space_time,
     schrodinger_pde_3d,
-    [ic_real, ic_imag, bc_real, bc_imag],
-    num_domain=200,        # 域内残差点
+    [ic_real, ic_imag],
+    num_domain=2000,        # 域内残差点
     num_boundary=50,       # 边界点
     num_initial=50,        # 初始时刻点
     num_test=100,
-    train_distribution="pseudo")
+    train_distribution="Hammersley")
 
 model = dde.Model(data, net)
 model.compile("adam", lr=1e-3, loss="MSE")
-losshistory, train_state = model.train(epochs=10, iterations=20, batch_size=10)
+losshistory, train_state = model.train(epochs=2, iterations=200)
 dde.saveplot(losshistory, train_state, issave=False, isplot=True)
 
 # model.compile("L-BFGS")
 # model.train()
 
-# # 选取 t_test 时间和 y=z=0 截面
-# t_test = 0.5
-# N = 200
-# x_line = np.linspace(-5, 5, N)
-# xyz = np.vstack([x_line, np.zeros(N), np.zeros(N)]).T
-#
-# # PINN 预测
-# X_test = np.hstack([xyz, t_test*np.ones((N,1))])
-# y_pred = model.predict(X_test)                          # 输出 (N,2)
-# psi_pinn = y_pred[:,0] + 1j*y_pred[:,1]
-#
-# # 解析解
-# psi_exact = analytic_solution_3d(xyz, t_test)
-#
-# # 绘图对比
-# plt.figure(figsize=(8,4))
-# plt.plot(x_line, psi_exact.real, '--', label='Analytic Real')
-# plt.plot(x_line, psi_pinn.real,  '-', label='PINN Real')
-# plt.plot(x_line, psi_exact.imag, '--', label='Analytic Imag')
-# plt.plot(x_line, psi_pinn.imag,  '-', label='PINN Imag')
-# plt.xlabel('x') ; plt.ylabel(r'$\psi$') ; plt.title(f'Wavefunction slice at y=z=0, t={t_test}')
-# plt.legend(); plt.tight_layout(); plt.show()
+
+
+# 选取 t_test 时间和 y=z=0 截面
+t_test = 0.5
+N = 200
+x_line = np.linspace(-5, 5, N)
+xyz = np.vstack([x_line, np.zeros(N), np.zeros(N)]).T
+
+# PINN 预测
+X_test = np.hstack([xyz, t_test*np.ones((N,1))])
+y_pred = model.predict(X_test)                          # 输出 (N,2)
+psi_pinn = y_pred[:,0] + 1j*y_pred[:,1]
+
+# 解析解
+psi_exact = analytic_solution_3d(xyz, t_test)
+
+# 绘图对比
+plt.figure(figsize=(8,4))
+plt.plot(x_line, psi_exact.real, '--', label='Analytic Real', color='red', linewidth=4)
+plt.plot(x_line, psi_pinn.real,  '-', label='PINN Real', color='red', linewidth=4)
+plt.plot(x_line, psi_exact.imag, '--', label='Analytic Imag', color='black', linewidth=4)
+plt.plot(x_line, psi_pinn.imag,  '-', label='PINN Imag', color='black', linewidth=4)
+plt.xlabel('x') ; plt.ylabel(r'$\psi$') ; plt.title(f'Wavefunction slice at y=z=0, t={t_test}')
+plt.legend(); plt.tight_layout(); plt.show()
+
+
 
 real_diffs = []
 imag_diffs = []
@@ -178,7 +175,7 @@ cmaps = ['coolwarm', 'coolwarm', 'plasma']
 
 for i in range(3):
     ax = fig.add_subplot(gs[0, i])
-    im = ax.imshow(diffs[i], extent=[x.min(), x.max(), t_values.min(), t_values.max()],
+    im = ax.imshow(diffs[i], extent=[t_values.min(), t_values.max(), x.min(), x.max()],
                    aspect='auto', origin='lower', cmap=cmaps[i])
     ax.set_xlabel('Time (t)')
     ax.set_ylabel('x')
