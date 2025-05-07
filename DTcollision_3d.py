@@ -1,168 +1,212 @@
 import deepxde as dde
+import torch as th
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
 
-R = 500.0
-geom = dde.geometry.Rectangle(xmin=[0.0, 0.0], xmax=[R, 2*np.pi])  # [r, φ] 域
-timedomain = dde.geometry.TimeDomain(0.0, 1.0)                    # 时间域 t∈[0,1]
-space_time = dde.geometry.GeometryXTime(geom, timedomain)          # 组合几何与时间
+
+# 最大半径
+R = 10.0
+# 球坐标域：r ∈ [0,R], θ ∈ [0,π], φ ∈ [0,2π]
+geom = dde.geometry.Cuboid(xmin=[0.0, 0.0, 0.0], xmax=[R, np.pi, 2*np.pi])
+# 时间域 t ∈ [0,T]
+T = 1.0
+timedomain = dde.geometry.TimeDomain(0.0, T)
+# 合成时空域
+space_time = dde.geometry.GeometryXTime(geom, timedomain)
 
 
-def schrodinger_pde_polar(x, y):
+def schrodinger_pde_spherical(x, y):
     """
-    x: (N,3) -> [r, φ, t]
+    x: (N,4) -> [r, θ, φ, t]
     y: (N,2) -> [ψ_r, ψ_i]
     """
-    psi_r, psi_i = y[:, 0:1], y[:, 1:2]
+    # 网络输出
+    psi_r = y[:, 0:1]
+    psi_i = y[:, 1:2]
 
     # 时间导数
-    psi_r_t = dde.grad.jacobian(y, x, i=0, j=2)
-    psi_i_t = dde.grad.jacobian(y, x, i=1, j=2)
+    psi_r_t = dde.grad.jacobian(y, x, i=0, j=3)
+    psi_i_t = dde.grad.jacobian(y, x, i=1, j=3)
 
-    # r 和 φ 的一阶、二阶导
+    # 对 r, θ, φ 求导
     psi_r_r   = dde.grad.jacobian(y, x, i=0, j=0)
     psi_r_rr  = dde.grad.hessian(y, x, i=0, j=0)
-    psi_r_pp  = dde.grad.hessian(y, x, i=0, j=1)
+    psi_r_th  = dde.grad.jacobian(y, x, i=0, j=1)
+    psi_r_thth = dde.grad.hessian(y, x, i=0, j=1)
+    psi_r_pp  = dde.grad.hessian(y, x, i=0, j=2)
 
     psi_i_r   = dde.grad.jacobian(y, x, i=1, j=0)
     psi_i_rr  = dde.grad.hessian(y, x, i=1, j=0)
-    psi_i_pp  = dde.grad.hessian(y, x, i=1, j=1)
+    psi_i_th  = dde.grad.jacobian(y, x, i=1, j=1)
+    psi_i_thth = dde.grad.hessian(y, x, i=1, j=1)
+    psi_i_pp  = dde.grad.hessian(y, x, i=1, j=2)
 
-    r = x[:, 0:1]
+    # 坐标分量
+    r     = x[:, 0]
+    theta = x[:, 1]
+    sin_t = th.sin(theta)
+    sin2_t = sin_t**2
 
-    # 极坐标拉普拉斯：ψ_rr + (1/r) ψ_r + (1/r^2) ψ_φφ
-    lap_r = psi_r_rr + psi_r_r / r + psi_r_pp / (r**2)
-    lap_i = psi_i_rr + psi_i_r / r + psi_i_pp / (r**2)
+    # 构造 Laplacian (实/虚部共用结构)
+    lap_r = (
+        psi_r_rr
+        + 2/r * psi_r_r
+        + (1/(r**2)) * psi_r_thth
+        + (th.cos(theta)/(r**2*sin_t)) * psi_r_th
+        + (1/(r**2*sin2_t)) * psi_r_pp
+    )
+    lap_i = (
+        psi_i_rr
+        + 2/r * psi_i_r
+        + (1/(r**2)) * psi_i_thth
+        + (th.cos(theta)/(r**2*sin_t)) * psi_i_th
+        + (1/(r**2*sin2_t)) * psi_i_pp
+    )
 
-    # 构造 PDE 残差：iψ_t + ½ Δψ = 0(正号负号???)
-    res_r = psi_i_t + 0.5 * lap_r
-    res_i = -psi_r_t + 0.5 * lap_i
+    # 实/虚部残差： iψ_t + ½Δψ = 0
+    res_r = psi_i_t - 0.5 * lap_r
+    res_i = -psi_r_t - 0.5 * lap_i
 
-    return [res_r, res_i]  # PINN 的 PDE 残差
+    return [res_r, res_i]
 
-def initial_wave_polar(x, r0=0.0, delta=0.5,
-                            k0=1.0):
-    r, phi = x[:,0:1], x[:,1:2]
+
+def initial_wave_spherical(x):
+    # x: (N,4) -> [r, θ, φ, t]
+    # k: (N,4) -> [k0, θ0, φ0]
+    k = th.tensor([1.0, 0.0, 0.0])
+    r0 = th.tensor(0.0)
+    delta = th.tensor(0.5)
+    m = th.tensor(1.0)
+
+    r = th.tensor(x[:, 0])
+    theta_r = th.tensor(x[:, 1])
+    phi_r = th.tensor(x[:, 2])
+
+    k0 = k[0]
+    theta_k = k[1]
+    phi_k= k[2]
+    # 参数
     A = (2*np.pi*delta**2)**(-3/4)
-    envelope = np.exp(-((r-r0)**2)/(4*delta**2))
-    phase_r = A * envelope * np.cos(k0 * r * np.cos(phi))
-    phase_i = A * envelope * np.sin(k0 * r * np.cos(phi))
-    return phase_r, phase_i
+    envelope = np.exp(-((r - r0)**2)/(4*delta**2))
+    # 极坐标系下：k·r = k0 * r * (sinφ_k * sinφ_r  * cos(θ_k-θ_r) + cosφ_k * cosφ_r)
+    phase_arg = k0 * r * (th.sin(phi_k)* th.sin(phi_r) * th.cos(theta_k-theta_r) + th.cos(theta_k) * th.cos(theta_r))
+    psi_r = A * envelope * th.cos(phase_arg)
+    psi_i = A * envelope * th.sin(phase_arg)
+    return psi_r, psi_i
 
-def analytic_solution_polar(x, t, r0=0.0, delta=0.5,
-                            k0=1.0,  # 径向动量大小
-                            m=1.0):
-    """
-    自由粒子在二维极坐标下高斯波包的解析解（Hartree 单位制：ℏ=1, m=1）。
 
-    参数
-    ----
-    r    : array_like, shape (N,)
-        径向坐标。
-    phi  : array_like, shape (N,)
-        角坐标，单位为弧度。
-    t    : float or array_like, shape (N,)
-        时间点。
-    r0   : float
-        初始包心在径向的偏移（通常取 0）。
-    delta: float
-        初始高斯包宽度。
-    k0   : float
-        初始动量大小，沿径向方向。
-    m    : float
-        质量，Hartree 单位制下取 1。
-    返回
-    ----
-    psi  : ndarray, shape (N,)
-        复数波函数值 ψ(r,φ,t)。
-    """
-    # x: (N,3)，是 [r,phi,t]
+# 在 t=0 时刻强制初始条件
+ic_real = dde.icbc.IC(space_time,
+                   lambda x: initial_wave_spherical(x)[0],
+                   lambda _, on_i: on_i)
+ic_imag = dde.icbc.IC(space_time,
+                   lambda x: initial_wave_spherical(x)[1],
+                   lambda _, on_i: on_i)
 
-    # 确保输入形状一致
-    r = x[:, 0].reshape(-1, 1)
-    phi = x[:, 1].reshape(-1, 1)
-    t = np.array(t)
+
+def analytic_solution_polar(x):
+    # 自由粒子在三维极坐标下高斯波包的解析解（Hartree 单位制：ℏ=1, m=1）。
+    # x: (N,4) -> [r, θ, φ, t]
+    # k: (N,4) -> [k0, θ0, φ0]
+    # r0: 默认与r方向一致
+
+    k = th.tensor([1.0, 0.0, 0.0])
+    r0 = th.tensor(0.0)
+    delta = th.tensor(0.5)
+    m = th.tensor(1.0)
+
+    r = th.tensor(x[:, 0])
+    theta_r = th.tensor(x[:, 1])
+    phi_r = th.tensor(x[:, 2])
+    t = th.tensor(x[:, 3])
+
+    k0 = k[0]
+    theta_k = k[1]
+    phi_k= k[2]
+
     # 1. 宽度演化 σ = Δ^2 + i t / (2m)
     sigma = delta ** 2 + 1j * t / (2 * m)
     # 2. 归一化因子
-    norm = (2 * np.pi * (delta + 1j * t / (2 * m * delta)) ** 2) ** (-3/4)
+    norm = (2 * th.pi * (delta + 1j * t / (2 * m * delta)) ** 2) ** (-3/4)
     # 3. 极坐标 → 笛卡尔转换
-    x = r * np.cos(phi)
-    y = r * np.sin(phi)
-    # 4. 平移项：径向动量 k0 沿径向传播
+    x_r = r * th.sin(theta_r) * th.cos(phi_r)
+    y_r = r * th.sin(theta_r) * th.sin(phi_r)
+    z_r = r * th.cos(theta_r)
+
+    x_k = k0 * th.sin(theta_k) * th.cos(phi_k)
+    y_k = k0 * th.sin(theta_k) * th.sin(phi_k)
+    z_k = k0 * th.cos(theta_k)
+    # 4. 平移项：径向动量 k0 沿径向传播(z轴)
     #    移动距离 = (k0/m) * t
-    dr = (k0 / m) * t
+    drx = (x_k / m) * t
+    dry = (y_k / m) * t
+    drz = (z_k / m) * t
     # 由极坐标可推出 x_shift, y_shift
-    x0 = r0 * np.cos(phi)
-    y0 = r0 * np.sin(phi)
-    xs = x0 + dr * np.cos(phi)
-    ys = y0 + dr * np.sin(phi)
+    x0 = r0 * th.sin(theta_r) * th.cos(phi_r)
+    y0 = r0 * th.sin(theta_r) * th.sin(phi_r)
+    z0 = r0 * th.cos(theta_r)
+
+    xs = x0 + drx
+    ys = y0 + dry
+    zs = z0 + drz
     # 5. 计算 (x-xs)^2+(y-ys)^2
-    dx2 = (x - xs) ** 2 + (y - ys) ** 2
-    # 6. 相位项： k0·r - (k0^2/(2m))t
-    #    因为 k0 目前纯径向，k·r = k0 * r
-    phase_arg = k0 * r - (k0 ** 2 / (2 * m)) * t
+    dx2 = (x_r - xs) ** 2 + (y_r - ys) ** 2 + (z_r - zs) ** 2
+    # 6. 相位项： k·r - (k0^2/(2m))t
+    # 极坐标系下：k·r = k0 * r * (sinφ_k * sinφ_r  * cos(θ_k-θ_r) + cosφ_k * cosφ_r)
+    phase_arg = (k0 * r * (th.sin(phi_k)* th.sin(phi_r) * th.cos(theta_k-theta_r) + th.cos(theta_k) * th.cos(theta_r))
+                 - (k0 ** 2 / (2 * m)) * t)
     # 7. 构造解析解
     psi = norm * np.exp(-dx2 / (4 * sigma) + 1j * phase_arg)
     return psi.flatten()
 
-# 在 t=0 时刻强制初始条件
-ic_real = dde.icbc.IC(space_time, lambda x: initial_wave_polar(x)[0], lambda _, on_initial: on_initial)
-ic_imag = dde.icbc.IC(space_time, lambda x: initial_wave_polar(x)[1], lambda _, on_initial: on_initial)
 
-# # 边界条件：r=R Dirichlet，φ 周期
-# def boundary_sphere(x, on_boundary):
-#     return on_boundary & np.isclose(x[0], R)
-#
-# bc_real = dde.DirichletBC(space_time, lambda x: 0, boundary_sphere, component=0)
-# bc_imag = dde.DirichletBC(space_time, lambda x: 0, boundary_sphere, component=1)
-# bc_phi = dde.PeriodicBC(space_time, [1], [0], component=0)
-
-
-net = dde.maps.FNN([3] + [50]*3 + [2], "relu", "Glorot uniform")  # 输入 3 维
+net = dde.maps.FNN([4] + [50]*3 + [2], "relu", "Glorot uniform")  # 输入 4 维
 data = dde.data.TimePDE(
     space_time,
-    schrodinger_pde_polar,
+    schrodinger_pde_spherical,
     [ic_real, ic_imag],
-    num_domain=200,        # 域内残差点
-    num_boundary=10,       # 边界点
-    num_initial=10,        # 初始时刻点
-    num_test=200,
-    train_distribution="Hammersley")
+    num_domain=2000,        # 域内残差点
+    # num_boundary=10,       # 边界点
+    num_initial=100,        # 初始时刻点
+    # num_test=1000,
+    train_distribution="pseudo")
 
 model = dde.Model(data, net)
 model.compile("adam", lr=1e-3, loss="MSE")
-losshistory, train_state = model.train(epochs=2, iterations=2000)
+losshistory, train_state = model.train(iterations=200)
 dde.saveplot(losshistory, train_state, issave=False, isplot=True)
 
 # model.compile("L-BFGS")
 # model.train()
 
 
-# 测试点
-t_test = 0.5
+# 测试点 只看 φ=pi; θ=0; t=0.5截面
 N = 100
-r_test = np.linspace(0, 5, N) #拉普拉斯算子存在导致r不能取太小
-phi_test = 0.5*np.full((1, N), np.pi)  # 例如只看 φ=pi 截面
-r_phi_test = np.vstack([r_test, phi_test]).T
+phi = np.pi
+theta = 0
+t = 0.5
+r = np.linspace(0, 10, N) # 拉普拉斯算子存在导致r不能取太小
+phi_test = np.full((1, N), phi)
+theta_test = np.full((1, N), theta)
+t_test = np.full((1, N), t)
+r_phi_theta_test = np.vstack([r, theta_test, phi_test, t_test]).T
 
 # 解析解
-psi_exact = analytic_solution_polar(r_phi_test, t_test)
+psi_exact = analytic_solution_polar(r_phi_theta_test)
 
 # PINN 预测
-X_test = np.hstack([r_phi_test, t_test*np.ones((N,1))])
-y_pred = model.predict(X_test)                          # 输出 (N,2)
+y_pred = model.predict(r_phi_theta_test)                          # 输出 (N,2)
 psi_pinn = y_pred[:,0] + 1j*y_pred[:,1]
 
 
 # 绘图对比
 plt.figure(figsize=(8,4))
-plt.plot(r_test, psi_exact.real, '--', label='Analytic Real', color='red', linewidth=2)
-plt.plot(r_test, psi_pinn.real,  '-', label='PINN Real', color='red', linewidth=2)
-plt.plot(r_test, psi_exact.imag, '--', label='Analytic Imag', color='black', linewidth=2)
-plt.plot(r_test, psi_pinn.imag,  '-', label='PINN Imag', color='black', linewidth=2)
-plt.xlabel('x') ; plt.ylabel(r'$\psi$') ; plt.title(f'Wavefunction slice at phi=0.5*pi, t={t_test}')
+plt.plot(r, psi_exact.real, '--', label='Analytic Real', color='red', linewidth=2)
+plt.plot(r, psi_pinn.real,  '-', label='PINN Real', color='red', linewidth=2)
+plt.plot(r, psi_exact.imag, '--', label='Analytic Imag', color='black', linewidth=2)
+plt.plot(r, psi_pinn.imag,  '-', label='PINN Imag', color='black', linewidth=2)
+plt.xlabel('r') ; plt.ylabel(r'$\psi$') ; plt.title(f'Wavefunction slice at phi={phi}, theta={theta}, t={t}')
 plt.legend(); plt.tight_layout(); plt.show()
 
 
@@ -170,21 +214,16 @@ real_diffs = []
 imag_diffs = []
 amp_diffs = []
 
-# 定义空间和时间范围
-N_new = 100
-r = np.linspace(0, 5, N_new) #拉普拉斯算子存在导致r不能取太小
-phi_test = 0.5*np.full((1, N), np.pi)  # 例如只看 φ=pi 截面
-t_values = np.linspace(0, 1, N_new)  # 所有时间点
+# 定义时间范围
+t_values = np.linspace(0, 1, 100)  # 所有时间点
 
 for t in t_values:
     t = np.array([[t]])  # 当前时间点
-    r_phi = np.vstack([r_test, phi_test]).T
-    X_test = np.hstack([r_phi, t.repeat(N, axis=0)])
-    y_pred = model.predict(X_test)
+    t_test = np.full((1, N), t)
+    r_phi_theta_test_all = np.vstack([r, theta_test, phi_test, t_test]).T
+    y_pred = model.predict(r_phi_theta_test_all)
     psi_pinn = y_pred[:, 0] + 1j * y_pred[:, 1]
-    # psi_pinn = psi_pinn.reshape(-1, 1)
-    psi_exact = analytic_solution_polar(r_phi, t)
-
+    psi_exact = analytic_solution_polar(r_phi_theta_test_all).detach().numpy()
 
     real_diff = np.real(psi_pinn - psi_exact)
     imag_diff = np.imag(psi_pinn - psi_exact)
@@ -212,7 +251,7 @@ for i in range(3):
     im = ax.imshow(diffs[i], extent=[t_values.min(), t_values.max(), r.min(), r.max()],
                    aspect='auto', origin='lower', cmap=cmaps[i])
     ax.set_xlabel('Time (t)')
-    ax.set_ylabel('x')
+    ax.set_ylabel('r')
     ax.set_title(labels[i])
     plt.colorbar(im, ax=ax)
 
