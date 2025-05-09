@@ -6,7 +6,7 @@ from matplotlib.gridspec import GridSpec
 
 
 # 最大半径
-R = 10.0
+R = 5.0
 # 球坐标域：r ∈ [0,R], θ ∈ [0,π], φ ∈ [0,2π]
 geom = dde.geometry.Cuboid(xmin=[0.0, 0.0, 0.0], xmax=[R, np.pi, 2*np.pi])
 # 时间域 t ∈ [0,T]
@@ -74,7 +74,7 @@ def schrodinger_pde_spherical(x, y):
 def initial_wave_spherical(x):
     # x: (N,4) -> [r, θ, φ, t]
     # k: (N,4) -> [k0, θ0, φ0]
-    k = th.tensor([1.0, 0.0, 0.0])
+    k = th.tensor([5.0, 0.0, 0.0])
     r0 = th.tensor(0.0)
     delta = th.tensor(0.5)
     m = th.tensor(1.0)
@@ -111,7 +111,7 @@ def analytic_solution_polar(x):
     # k: (N,4) -> [k0, θ0, φ0]
     # r0: 默认与r方向一致
 
-    k = th.tensor([1.0, 0.0, 0.0])
+    k = th.tensor([5.0, 0.0, 0.0])
     r0 = th.tensor(0.0)
     delta = th.tensor(0.5)
     m = th.tensor(1.0)
@@ -158,23 +158,27 @@ def analytic_solution_polar(x):
                  - (k0 ** 2 / (2 * m)) * t)
     # 7. 构造解析解
     psi = norm * np.exp(-dx2 / (4 * sigma) + 1j * phase_arg)
-    return psi.flatten()
+    psi_real = psi.real.detach().numpy()
+    psi_imag = psi.imag.detach().numpy()
+
+    return psi_real, psi_imag
 
 
-net = dde.maps.FNN([4] + [50]*3 + [2], "relu", "Glorot uniform")  # 输入 4 维
+net = dde.maps.FNN([4] + [500]*3 + [2], "relu", "Glorot uniform")  # 输入 4 维
 data = dde.data.TimePDE(
     space_time,
     schrodinger_pde_spherical,
     [ic_real, ic_imag],
     num_domain=2000,        # 域内残差点
     # num_boundary=10,       # 边界点
-    num_initial=100,        # 初始时刻点
-    # num_test=1000,
+    num_initial=10,        # 初始时刻点
+    num_test=1000,
+    # solution=analytic_solution_polar()[2],
     train_distribution="pseudo")
 
 model = dde.Model(data, net)
-model.compile("adam", lr=1e-3, loss="MSE")
-losshistory, train_state = model.train(iterations=200)
+model.compile("adam", lr=1e-2, loss="MSE")
+losshistory, train_state = model.train(epochs=1, iterations=2000)
 dde.saveplot(losshistory, train_state, issave=False, isplot=True)
 
 # model.compile("L-BFGS")
@@ -186,27 +190,28 @@ N = 100
 phi = np.pi
 theta = 0
 t = 0.5
-r = np.linspace(0, 10, N) # 拉普拉斯算子存在导致r不能取太小
+r = np.linspace(0, R, N) # 拉普拉斯算子存在导致r不能取太小
 phi_test = np.full((1, N), phi)
 theta_test = np.full((1, N), theta)
 t_test = np.full((1, N), t)
 r_phi_theta_test = np.vstack([r, theta_test, phi_test, t_test]).T
 
 # 解析解
-psi_exact = analytic_solution_polar(r_phi_theta_test)
+psi_exact_real, psi_exact_imag= analytic_solution_polar(r_phi_theta_test)
 
 # PINN 预测
 y_pred = model.predict(r_phi_theta_test)                          # 输出 (N,2)
-psi_pinn = y_pred[:,0] + 1j*y_pred[:,1]
+psi_pinn_real = y_pred[:,0]
+psi_pinn_imag = y_pred[:,1]
 
 
 # 绘图对比
 plt.figure(figsize=(8,4))
-plt.plot(r, psi_exact.real, '--', label='Analytic Real', color='red', linewidth=2)
-plt.plot(r, psi_pinn.real,  '-', label='PINN Real', color='red', linewidth=2)
-plt.plot(r, psi_exact.imag, '--', label='Analytic Imag', color='black', linewidth=2)
-plt.plot(r, psi_pinn.imag,  '-', label='PINN Imag', color='black', linewidth=2)
-plt.xlabel('r') ; plt.ylabel(r'$\psi$') ; plt.title(f'Wavefunction slice at phi={phi}, theta={theta}, t={t}')
+plt.plot(r, psi_exact_real, '--', label='Analytic Real', color='red', linewidth=2)
+plt.plot(r, psi_pinn_real,  '-', label='PINN Real', color='red', linewidth=2)
+plt.plot(r, psi_exact_imag, '--', label='Analytic Imag', color='black', linewidth=2)
+plt.plot(r, psi_pinn_imag,  '-', label='PINN Imag', color='black', linewidth=2)
+plt.xlabel('r') ; plt.ylabel(r'$\psi$') ; plt.title(f'Wavefunction slice at phi={phi:.2f}, theta={theta}, t={t}')
 plt.legend(); plt.tight_layout(); plt.show()
 
 
@@ -222,11 +227,18 @@ for t in t_values:
     t_test = np.full((1, N), t)
     r_phi_theta_test_all = np.vstack([r, theta_test, phi_test, t_test]).T
     y_pred = model.predict(r_phi_theta_test_all)
-    psi_pinn = y_pred[:, 0] + 1j * y_pred[:, 1]
-    psi_exact = analytic_solution_polar(r_phi_theta_test_all).detach().numpy()
+    psi_pinn_real = y_pred[:, 0]
+    psi_pinn_imag = y_pred[:, 1]
 
-    real_diff = np.real(psi_pinn - psi_exact)
-    imag_diff = np.imag(psi_pinn - psi_exact)
+    psi_exact_real, psi_exact_imag= analytic_solution_polar(r_phi_theta_test_all)
+    # psi_exact_real = psi_exact_real.detach().numpy()
+    # psi_exact_imag = psi_exact_imag.detach().numpy()
+
+
+    real_diff = psi_pinn_real - psi_exact_real
+    imag_diff = psi_pinn_imag - psi_exact_imag
+    psi_pinn = psi_pinn_real + 1j*psi_pinn_imag
+    psi_exact = psi_exact_real + 1j*psi_exact_imag
     amp_diff = np.abs(psi_pinn) - np.abs(psi_exact)
 
     real_diffs.append(real_diff)
