@@ -39,7 +39,12 @@ class SchrodingerEquationSolver:
         )
         # 创建模型
         self.model = dde.Model(self.data, self.net)
-        self.model.compile("adam", lr=1e-2, loss="MSE")
+        self.model.compile(
+            optimizer="adam",
+            lr=1e-3,
+            loss=["MSE", "MSE", "MSE", "MSE"], # 默认的 PDE/IC/BC 残差损失（如 "MSE"）
+            loss_weights=[1.0, 1.0, 10.0, 10.0]
+        )
 
         losshistory, train_state = self.model.train(epochs=1, iterations=self.iterations)
         dde.saveplot(losshistory, train_state, issave=False, isplot=True)
@@ -275,13 +280,13 @@ if __name__ == "__main__":
     space_time = dde.geometry.GeometryXTime(geom, timedomain)
 
     # 创建求解器实例
-    k = th.tensor([5.0, 0.0, 0.0]) # 初始波矢
+    k = th.tensor([5.0, 0.0, 0.0]) # 初始动量
     r0 = th.tensor(0.0) # 中心坐标
     delta = th.tensor(1.0) # 波包宽度参数
     m = th.tensor(1.0) # 质量
-    num_domain = 2000 # 球内采样
-    num_initial = 10 # 边界采样
-    num_test = 1000 # 测试点
+    num_domain = 200 # 球内采样
+    num_initial = 1000 # 边界采样
+    num_test = 100 # 测试点
 
     iterations = 2 # 训练轮数
     solver = SchrodingerEquationSolver(space_time, k, r0, delta, m, R, T, num_domain, num_initial, num_test, iterations)
