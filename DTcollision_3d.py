@@ -3,10 +3,20 @@ import torch as th
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
+import os
+
+os.environ["DDE_BACKEND"] = "pytorch"  # DeepXDE 将自动切换到 PyTorch 后端
+
 
 
 class SchrodingerEquationSolver:
-    def __init__(self, space_time, k, r0, delta, m, R, T, num_domain, num_initial, num_test, iterations):
+    def __init__(self, space_time, k, r0, delta, m, R, T, num_domain, num_initial, num_test, iterations,
+                 norm_samples, fixed_times, num_spatial_points_per_time):
+
+        self.num_spatial_points_per_time = num_spatial_points_per_time
+        self.fixed_times = fixed_times
+        self.norm_samples = norm_samples
+
         self.space_time = space_time
         self.k = k
         self.r0 = r0
@@ -19,10 +29,10 @@ class SchrodingerEquationSolver:
         self.num_test = num_test
         self.iterations = iterations
         # 在 t=0 时刻强制初始条件
-        self.ic_real = dde.icbc.IC(space_time,
+        self.ic_real = dde.icbc.IC(self.space_time,
                                    lambda x: self.initial_wave_spherical(x)[0],
                                    lambda _, on_i: on_i)
-        self.ic_imag = dde.icbc.IC(space_time,
+        self.ic_imag = dde.icbc.IC(self.space_time,
                                    lambda x: self.initial_wave_spherical(x)[1],
                                    lambda _, on_i: on_i)
         # 创建网络
@@ -42,22 +52,55 @@ class SchrodingerEquationSolver:
         self.model.compile(
             optimizer="adam",
             lr=1e-3,
-            loss=["MSE", "MSE", "MSE", "MSE"], # 默认的 PDE/IC/BC 残差损失（如 "MSE"）
-            loss_weights=[1.0, 1.0, 10.0, 10.0]
-        )
+            loss=["MSE", # PDE 实部残差
+                  "MSE", # PDE 虚部残差
+                  "MSE", # IC real
+                  "MSE",], # IC imag
+            loss_weights=[1.0, 1.0, 10.0, 10.0])
 
-        losshistory, train_state = self.model.train(epochs=1, iterations=self.iterations)
+        # 训练模型，添加自定义回调
+        callback = self.NormLossCallback(self.norm_samples, self.fixed_times, self.num_spatial_points_per_time)
+        losshistory, train_state = self.model.train(epochs=1, iterations=self.iterations, callbacks=[callback])
         dde.saveplot(losshistory, train_state, issave=False, isplot=True)
+
+    class NormLossCallback(dde.callbacks.Callback):
+        def __init__(self, norm_samples, fixed_times, num_spatial_points_per_time):
+            super().__init__()
+            self.norm_samples = norm_samples
+            self.fixed_times = fixed_times
+            self.num_spatial_points_per_time = num_spatial_points_per_time
+
+        def on_epoch_end(self):
+            # 获取模型的预测结果
+            y_pred = self.model.predict(self.norm_samples)
+
+            # 筛选出固定时刻下的输出值
+            y_values = []
+            start_idx = 0
+            for _ in self.fixed_times:
+                end_idx = start_idx + self.num_spatial_points_per_time
+                y_values.append(y_pred[start_idx:end_idx])
+                start_idx = end_idx
+
+            # 计算归一化损失
+            norm_loss_val = self.calculate_norm_loss(y_values)
+            print(f"Normalization Loss = {norm_loss_val:.6f}")
+
+        def calculate_norm_loss(self, y_values):
+            total_loss = 0
+            for y in y_values:
+                u, v = y[:, 0], y[:, 1]
+                density = u ** 2 + v ** 2
+                mean_density = np.mean(density)
+                total_loss += (mean_density - 1.0) ** 2
+            return total_loss / len(y_values)
+
 
     def schrodinger_pde_spherical(self, x, y):
         """
         x: (N,4) -> [r, θ, φ, t]
         y: (N,2) -> [ψ_r, ψ_i]
         """
-        # 网络输出
-        psi_r = y[:, 0:1]
-        psi_i = y[:, 1:2]
-
         # 时间导数
         psi_r_t = dde.grad.jacobian(y, x, i=0, j=3)
         psi_i_t = dde.grad.jacobian(y, x, i=1, j=3)
@@ -267,8 +310,11 @@ class SchrodingerEquationSolver:
 
         plt.show()
 
+
+
 # 示例用法
 if __name__ == "__main__":
+
     # 最大半径
     R = 5.0
     # 球坐标域：r ∈ [0,R], θ ∈ [0,π], φ ∈ [0,2π]
@@ -279,17 +325,33 @@ if __name__ == "__main__":
     # 合成时空域
     space_time = dde.geometry.GeometryXTime(geom, timedomain)
 
+    # 定义固定时刻（例如，在时间域 [0, T] 内均匀分布的 5 个时刻）
+    fixed_times = np.linspace(0, T, 5)  # 5 个固定时刻
+    # 定义每个固定时刻的空间采样点数量
+    num_spatial_points_per_time = 100
+    # 生成空间采样点
+    spatial_points = geom.uniform_points(num_spatial_points_per_time)
+    # 将空间采样点与固定时刻组合
+    norm_samples = []
+    for t in fixed_times:
+        t_points = np.full((spatial_points.shape[0], 1), t)
+        norm_samples.append(np.hstack((spatial_points, t_points)))
+
+    norm_samples = np.vstack(norm_samples)
+
     # 创建求解器实例
     k = th.tensor([5.0, 0.0, 0.0]) # 初始动量
-    r0 = th.tensor(0.0) # 中心坐标
+    r0 = th.tensor(5.0) # 启示坐标
     delta = th.tensor(1.0) # 波包宽度参数
     m = th.tensor(1.0) # 质量
     num_domain = 200 # 球内采样
-    num_initial = 1000 # 边界采样
+    num_initial = 1000 # 起始采样
     num_test = 100 # 测试点
 
     iterations = 2 # 训练轮数
-    solver = SchrodingerEquationSolver(space_time, k, r0, delta, m, R, T, num_domain, num_initial, num_test, iterations)
+    solver = SchrodingerEquationSolver(space_time, k, r0, delta, m, R, T, num_domain, num_initial, num_test, iterations,
+                                       norm_samples, fixed_times, num_spatial_points_per_time)
 
     solver.predict_and_plot()
     solver.calculate_and_plot_diffs()
+
