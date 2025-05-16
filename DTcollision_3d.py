@@ -54,13 +54,14 @@ class SchrodingerEquationSolver:
             lr=1e-3,
             loss=["MSE", # PDE 实部残差
                   "MSE", # PDE 虚部残差
+                  "MSE", # 归一化损失
                   "MSE", # IC real
                   "MSE",], # IC imag
-            loss_weights=[1.0, 1.0, 10.0, 10.0])
+            loss_weights=[1.0, 1.0, 10, 10.0, 10.0])
 
         # 训练模型，添加自定义回调
-        callback = self.NormLossCallback(self.norm_samples, self.fixed_times, self.num_spatial_points_per_time)
-        losshistory, train_state = self.model.train(epochs=1, iterations=self.iterations, callbacks=[callback])
+        self.callback = self.NormLossCallback(self.norm_samples, self.fixed_times, self.num_spatial_points_per_time)
+        losshistory, train_state = self.model.train(epochs=1, iterations=self.iterations, callbacks=[self.callback])
         dde.saveplot(losshistory, train_state, issave=False, isplot=True)
 
     class NormLossCallback(dde.callbacks.Callback):
@@ -84,7 +85,8 @@ class SchrodingerEquationSolver:
 
             # 计算归一化损失
             norm_loss_val = self.calculate_norm_loss(y_values)
-            print(f"Normalization Loss = {norm_loss_val:.6f}")
+            # print(f"Normalization Loss = {norm_loss_val:.6f}")
+            return norm_loss_val
 
         def calculate_norm_loss(self, y_values):
             total_loss = 0
@@ -101,6 +103,7 @@ class SchrodingerEquationSolver:
         x: (N,4) -> [r, θ, φ, t]
         y: (N,2) -> [ψ_r, ψ_i]
         """
+
         # 时间导数
         psi_r_t = dde.grad.jacobian(y, x, i=0, j=3)
         psi_i_t = dde.grad.jacobian(y, x, i=1, j=3)
@@ -144,7 +147,11 @@ class SchrodingerEquationSolver:
         res_r = psi_i_t - 0.5 * lap_r
         res_i = -psi_r_t - 0.5 * lap_i
 
-        return [res_r, res_i]
+        norm_loss = self.callback.on_epoch_end()
+        norm_loss = th.from_numpy(np.array([norm_loss], dtype=np.float32))
+        norm_loss_expanded = norm_loss.expand_as(res_i)
+
+        return [res_r, res_i, norm_loss_expanded]
 
     def initial_wave_spherical(self, x):
         # x: (N,4) -> [r, θ, φ, t]
@@ -154,8 +161,8 @@ class SchrodingerEquationSolver:
         theta_r = th.tensor(x[:, 1])
         phi_r = th.tensor(x[:, 2])
         # 参数
-        A = (2 * np.pi * self.delta ** 2) ** (-3 / 4)
-        envelope = np.exp(-((r - self.r0) ** 2) / (4 * self.delta ** 2))
+        A = (2 * th.pi * self.delta ** 2) ** (-3 / 4)
+        envelope = th.exp(-((r - self.r0) ** 2) / (4 * self.delta ** 2))
         # 极坐标系下：k·r = k0 * r * (sinφ_k * sinφ_r  * cos(θ_k-θ_r) + cosφ_k * cosφ_r)
         phase_arg = (k0 * r * (
                 th.sin(phi_k) * th.sin(phi_r) * th.cos(theta_k - theta_r)
@@ -214,7 +221,7 @@ class SchrodingerEquationSolver:
             - (k0 ** 2 / (2 * self.m)) * t
         )
         # 7. 构造解析解
-        psi = norm * np.exp(-dx2 / (4 * sigma) + 1j * phase_arg)
+        psi = norm * th.exp(-dx2 / (4 * sigma) + 1j * phase_arg)
         psi_real = psi.real.detach().numpy()
         psi_imag = psi.imag.detach().numpy()
 
@@ -227,7 +234,7 @@ class SchrodingerEquationSolver:
         phi = np.pi
         theta = 0
         t = 0.5
-        r = np.linspace(0, self.R, N)
+        r = np.linspace(-self.R, self.R, N)
         phi_test = np.full((1, N), phi)
         theta_test = np.full((1, N), theta)
         t_test = np.full((1, N), t)
@@ -260,7 +267,7 @@ class SchrodingerEquationSolver:
         N = 100
         phi = np.pi
         theta = 0
-        r = np.linspace(0, self.R, N)
+        r = np.linspace(-self.R, self.R, N)
         phi_test = np.full((1, N), phi)
         theta_test = np.full((1, N), theta)
 
@@ -325,10 +332,10 @@ if __name__ == "__main__":
     # 合成时空域
     space_time = dde.geometry.GeometryXTime(geom, timedomain)
 
-    # 定义固定时刻（例如，在时间域 [0, T] 内均匀分布的 5 个时刻）
-    fixed_times = np.linspace(0, T, 5)  # 5 个固定时刻
+    # 定义固定时刻（例如，在时间域 [0, T] 内均匀分布的 n 个时刻）
+    fixed_times = np.linspace(0, T, 3)  # 固定时刻
     # 定义每个固定时刻的空间采样点数量
-    num_spatial_points_per_time = 100
+    num_spatial_points_per_time = 1000
     # 生成空间采样点
     spatial_points = geom.uniform_points(num_spatial_points_per_time)
     # 将空间采样点与固定时刻组合
@@ -340,8 +347,8 @@ if __name__ == "__main__":
     norm_samples = np.vstack(norm_samples)
 
     # 创建求解器实例
-    k = th.tensor([5.0, 0.0, 0.0]) # 初始动量
-    r0 = th.tensor(5.0) # 启示坐标
+    k = th.tensor([10.0, 0.0, 0.0]) # 初始动量
+    r0 = th.tensor(-5.0) # 起始坐标
     delta = th.tensor(1.0) # 波包宽度参数
     m = th.tensor(1.0) # 质量
     num_domain = 200 # 球内采样
