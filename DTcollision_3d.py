@@ -61,7 +61,7 @@ class SchrodingerEquationSolver:
 
         # 训练模型，添加自定义回调
         self.callback = self.NormLossCallback(self.norm_samples, self.fixed_times, self.num_spatial_points_per_time)
-        losshistory, train_state = self.model.train(epochs=1, iterations=self.iterations, callbacks=[self.callback])
+        losshistory, train_state = self.model.train(epochs=1, display_every=1, iterations=self.iterations, callbacks=[self.callback])
         dde.saveplot(losshistory, train_state, issave=False, isplot=True)
 
     class NormLossCallback(dde.callbacks.Callback):
@@ -157,12 +157,28 @@ class SchrodingerEquationSolver:
         # x: (N,4) -> [r, θ, φ, t]
         # k: (N,3) -> [k0, θ0, φ0]
         k0, theta_k, phi_k = self.k[0], self.k[1], self.k[2]
+
         r = th.tensor(x[:, 0])
         theta_r = th.tensor(x[:, 1])
         phi_r = th.tensor(x[:, 2])
+
+        r0 = self.r0[0]
+        theta_r0 = self.r0[1]
+        phi_r0 = self.r0[2]
         # 参数
         A = (2 * th.pi * self.delta ** 2) ** (-3 / 4)
-        envelope = th.exp(-((r - self.r0) ** 2) / (4 * self.delta ** 2))
+        # 极坐标 → 笛卡尔转换
+        x_r = r * th.sin(theta_r) * th.cos(phi_r)
+        y_r = r * th.sin(theta_r) * th.sin(phi_r)
+        z_r = r * th.cos(theta_r)
+
+        x_r0 = r0 * th.sin(theta_r0) * th.cos(phi_r0)
+        y_r0 = r0 * th.sin(theta_r0) * th.sin(phi_r0)
+        z_r0 = r0 * th.cos(theta_r0)
+        # 计算矢量（r-r0）**2
+        r_r0_2 = (x_r - x_r0) ** 2 + (y_r - y_r0) ** 2 + (z_r - z_r0) ** 2
+
+        envelope = th.exp(-r_r0_2 / (4 * self.delta ** 2))
         # 极坐标系下：k·r = k0 * r * (sinφ_k * sinφ_r  * cos(θ_k-θ_r) + cosφ_k * cosφ_r)
         phase_arg = (k0 * r * (
                 th.sin(phi_k) * th.sin(phi_r) * th.cos(theta_k - theta_r)
@@ -180,11 +196,15 @@ class SchrodingerEquationSolver:
         # r0: 默认与r方向一致
 
         k0, theta_k, phi_k = self.k[0], self.k[1], self.k[2]
+
         r = th.tensor(x[:, 0])
         theta_r = th.tensor(x[:, 1])
         phi_r = th.tensor(x[:, 2])
         t = th.tensor(x[:, 3])
 
+        r0 = self.r0[0]
+        theta_r0 = self.r0[1]
+        phi_r0 = self.r0[2]
         # 1. 宽度演化 σ = Δ^2 + i t / (2m)
         sigma = self.delta ** 2 + 1j * t / (2 * self.m)
         # 2. 归一化因子
@@ -194,23 +214,22 @@ class SchrodingerEquationSolver:
         y_r = r * th.sin(theta_r) * th.sin(phi_r)
         z_r = r * th.cos(theta_r)
 
+        x0 = r0 * th.sin(theta_r0) * th.cos(phi_r0)
+        y0 = r0 * th.sin(theta_r0) * th.sin(phi_r0)
+        z0 = r0 * th.cos(theta_r0)
+
         x_k = k0 * th.sin(theta_k) * th.cos(phi_k)
         y_k = k0 * th.sin(theta_k) * th.sin(phi_k)
         z_k = k0 * th.cos(theta_k)
-        # 4. 平移项：径向动量 k0 沿径向传播(z轴)
-        #    移动距离 = (k0/m) * t
+        # 4. 移动距离 = (k0/m) * t
         drx = (x_k / self.m) * t
         dry = (y_k / self.m) * t
         drz = (z_k / self.m) * t
-        # 由极坐标可推出 x_shift, y_shift
-        x0 = self.r0 * th.sin(theta_r) * th.cos(phi_r)
-        y0 = self.r0 * th.sin(theta_r) * th.sin(phi_r)
-        z0 = self.r0 * th.cos(theta_r)
 
         xs = x0 + drx
         ys = y0 + dry
         zs = z0 + drz
-        # 5. 计算 (x-xs)^2+(y-ys)^2
+        # 5. 计算 [r-(r0+(k0/m)*t)]^2
         dx2 = (x_r - xs) ** 2 + (y_r - ys) ** 2 + (z_r - zs) ** 2
         # 6. 相位项： k·r - (k0^2/(2m))t
         # 极坐标系下：k·r = k0 * r * (sinφ_k * sinφ_r  * cos(θ_k-θ_r) + cosφ_k * cosφ_r)
@@ -348,14 +367,14 @@ if __name__ == "__main__":
 
     # 创建求解器实例
     k = th.tensor([10.0, 0.0, 0.0]) # 初始动量
-    r0 = th.tensor(-5.0) # 起始坐标
+    r0 = th.tensor([-5.0, 0.0, 0.0]) # 起始坐标
     delta = th.tensor(1.0) # 波包宽度参数
     m = th.tensor(1.0) # 质量
     num_domain = 200 # 球内采样
     num_initial = 1000 # 起始采样
     num_test = 100 # 测试点
 
-    iterations = 2 # 训练轮数
+    iterations = 20 # 训练轮数
     solver = SchrodingerEquationSolver(space_time, k, r0, delta, m, R, T, num_domain, num_initial, num_test, iterations,
                                        norm_samples, fixed_times, num_spatial_points_per_time)
 
