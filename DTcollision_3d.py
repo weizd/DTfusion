@@ -11,7 +11,15 @@ os.environ["DDE_BACKEND"] = "pytorch"  # DeepXDE 将自动切换到 PyTorch 后�
 
 class SchrodingerEquationSolver:
     def __init__(self, space_time, k, r0, delta, m, R, T, num_domain, num_initial, num_test, iterations,
-                 norm_samples, fixed_times, num_spatial_points_per_time):
+                 norm_samples, fixed_times, num_spatial_points_per_time,
+                 loss_PDE_real, loss_PDE_imag, loss_nomr, loss_IC_real, loss_IC_imag, lr):
+
+        self.lr = lr
+        self.loss_PDE_real = loss_PDE_real
+        self.loss_PDE_imag = loss_PDE_imag
+        self.loss_nomr = loss_nomr
+        self.loss_IC_real = loss_IC_real
+        self.loss_IC_imag = loss_IC_imag
 
         self.num_spatial_points_per_time = num_spatial_points_per_time
         self.fixed_times = fixed_times
@@ -51,13 +59,13 @@ class SchrodingerEquationSolver:
         self.model = dde.Model(self.data, self.net)
         self.model.compile(
             optimizer="adam",
-            lr=1e-3,
+            lr=self.lr,
             loss=["MSE", # PDE 实部残差
                   "MSE", # PDE 虚部残差
                   "MSE", # 归一化损失
                   "MSE", # IC real
                   "MSE",], # IC imag
-            loss_weights=[1.0, 1.0, 10, 10.0, 10.0])
+            loss_weights=[self.loss_PDE_real, self.loss_PDE_imag, self.loss_nomr, self.loss_IC_real, self.loss_IC_imag])
 
         # 训练模型，添加自定义回调
         self.callback = self.NormLossCallback(self.norm_samples, self.fixed_times, self.num_spatial_points_per_time)
@@ -122,8 +130,8 @@ class SchrodingerEquationSolver:
         psi_i_pp = dde.grad.hessian(y, x, i=1, j=2)
 
         # 坐标分量
-        r = x[:, 0]
-        theta = x[:, 1]
+        r = x[:, 0].reshape(-1, 1)
+        theta = x[:, 1].reshape(-1, 1)
         sin_t = th.sin(theta)
         sin2_t = sin_t ** 2
 
@@ -158,9 +166,9 @@ class SchrodingerEquationSolver:
         # k: (N,3) -> [k0, θ0, φ0]
         k0, theta_k, phi_k = self.k[0], self.k[1], self.k[2]
 
-        r = th.tensor(x[:, 0])
-        theta_r = th.tensor(x[:, 1])
-        phi_r = th.tensor(x[:, 2])
+        r = th.tensor(x[:, 0]).reshape(-1, 1)
+        theta_r = th.tensor(x[:, 1]).reshape(-1, 1)
+        phi_r = th.tensor(x[:, 2]).reshape(-1, 1)
 
         r0 = self.r0[0]
         theta_r0 = self.r0[1]
@@ -342,7 +350,7 @@ class SchrodingerEquationSolver:
 if __name__ == "__main__":
 
     # 最大半径
-    R = 5.0
+    R = 1.0
     # 球坐标域：r ∈ [0,R], θ ∈ [0,π], φ ∈ [0,2π]
     geom = dde.geometry.Cuboid(xmin=[0.0, 0.0, 0.0], xmax=[R, np.pi, 2 * np.pi])
     # 时间域 t ∈ [0,T]
@@ -352,7 +360,7 @@ if __name__ == "__main__":
     space_time = dde.geometry.GeometryXTime(geom, timedomain)
 
     # 定义固定时刻（例如，在时间域 [0, T] 内均匀分布的 n 个时刻）
-    fixed_times = np.linspace(0, T, 3)  # 固定时刻
+    fixed_times = np.linspace(0.2*T, 0.6*T, 3)  # 固定时刻
     # 定义每个固定时刻的空间采样点数量
     num_spatial_points_per_time = 1000
     # 生成空间采样点
@@ -365,18 +373,28 @@ if __name__ == "__main__":
 
     norm_samples = np.vstack(norm_samples)
 
+    # 学习率
+    lr = 1e-3
+    # 损失权重
+    loss_PDE_real = 1e-8
+    loss_PDE_imag = 1e-8
+    loss_nomr = 1.0
+    loss_IC_real = 1.0
+    loss_IC_imag = 1.0
+
     # 创建求解器实例
-    k = th.tensor([10.0, 0.0, 0.0]) # 初始动量
-    r0 = th.tensor([-5.0, 0.0, 0.0]) # 起始坐标
+    k = th.tensor([2*R, 0.0, 0.0]) # 初始动量
+    r0 = th.tensor([-R, 0.0, 0.0]) # 起始坐标
     delta = th.tensor(1.0) # 波包宽度参数
     m = th.tensor(1.0) # 质量
-    num_domain = 200 # 球内采样
+    num_domain = 1000 # 球内采样
     num_initial = 1000 # 起始采样
-    num_test = 100 # 测试点
+    num_test = 1000 # 测试点
 
-    iterations = 20 # 训练轮数
+    iterations = 5 # 训练轮数
     solver = SchrodingerEquationSolver(space_time, k, r0, delta, m, R, T, num_domain, num_initial, num_test, iterations,
-                                       norm_samples, fixed_times, num_spatial_points_per_time)
+                                       norm_samples, fixed_times, num_spatial_points_per_time,
+                                       loss_PDE_real, loss_PDE_imag, loss_nomr, loss_IC_real, loss_IC_imag, lr)
 
     solver.predict_and_plot()
     solver.calculate_and_plot_diffs()
