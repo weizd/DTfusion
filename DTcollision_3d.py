@@ -114,12 +114,15 @@ class SchrodingerEquationSolver:
 
         # 时间导数
         psi_r_t = dde.grad.jacobian(y, x, i=0, j=3)
+        # psi_r_t_num = psi_r_t.detach().numpy()
         psi_i_t = dde.grad.jacobian(y, x, i=1, j=3)
-
+        # psi_i_t_num = psi_i_t.detach().numpy()
         # 对 r, θ, φ 求导
         psi_r_r = dde.grad.jacobian(y, x, i=0, j=0)
+        # psi_r_r_num = psi_r_r.detach().numpy()
         psi_r_rr = dde.grad.hessian(y, x, i=0, j=0)
         psi_r_th = dde.grad.jacobian(y, x, i=0, j=1)
+        # psi_r_th_num = psi_r_th.detach().numpy()
         psi_r_thth = dde.grad.hessian(y, x, i=0, j=1)
         psi_r_pp = dde.grad.hessian(y, x, i=0, j=2)
 
@@ -143,6 +146,7 @@ class SchrodingerEquationSolver:
                 + (th.cos(theta) / (r ** 2 * sin_t)) * psi_r_th
                 + (1 / (r ** 2 * sin2_t)) * psi_r_pp
         )
+        # lap_r_num = lap_r.detach().numpy()
         lap_i = (
                 psi_i_rr
                 + 2 / r * psi_i_r
@@ -154,6 +158,14 @@ class SchrodingerEquationSolver:
         # 实/虚部残差： iψ_t + ½Δψ = 0
         res_r = psi_i_t - 0.5 * lap_r
         res_i = -psi_r_t - 0.5 * lap_i
+
+        threshold = 1e2
+
+        # 对res_r中大于threshold的值设为0
+        res_r = th.where(th.abs(res_r) > threshold, th.tensor(0.0, device=res_r.device), res_r)
+        # res_r_num = res_r.detach().numpy()
+        # 对res_i中大于threshold的值设为0
+        res_i = th.where(th.abs(res_i) > threshold, th.tensor(0.0, device=res_i.device), res_i)
 
         norm_loss = self.callback.on_epoch_end()
         norm_loss = th.from_numpy(np.array([norm_loss], dtype=np.float32))
@@ -349,6 +361,11 @@ class SchrodingerEquationSolver:
 # 示例用法
 if __name__ == "__main__":
 
+    # 告诉PyTorch不使用GPU
+    th.set_default_tensor_type(th.FloatTensor)  ###
+    # device = th.device("cuda" if th.cuda.is_available() else "cpu")
+    # print("device:", device)
+
     # 最大半径
     R = 1.0
     # 球坐标域：r ∈ [0,R], θ ∈ [0,π], φ ∈ [0,2π]
@@ -376,8 +393,8 @@ if __name__ == "__main__":
     # 学习率
     lr = 1e-3
     # 损失权重
-    loss_PDE_real = 1e-8
-    loss_PDE_imag = 1e-8
+    loss_PDE_real = 1e-2
+    loss_PDE_imag = 1e-2
     loss_nomr = 1.0
     loss_IC_real = 1.0
     loss_IC_imag = 1.0
