@@ -130,6 +130,12 @@ class Solver3DSpherical:
         # 残差
         res_r, res_i = self.schrodinger_residual()
         mse_pde = torch.mean(res_r**2) + torch.mean(res_i**2)
+        lr_ic = 1
+        lr_pde = 1e-3
+        lr_norm = 1e-3
+        mse_ic = mse_ic * lr_ic
+        mse_pde = mse_pde * lr_pde
+        mse_norm = mse_norm * lr_norm
         loss = mse_ic + mse_pde + mse_norm
         return loss, mse_ic, mse_pde, mse_norm
 
@@ -431,7 +437,7 @@ if __name__ == '__main__':
     model = PINN3DSpherical(layers)
     solver = Solver3DSpherical(model, X0, U0, V0, X_f, X1, mean_density)
     # 训练
-    history = solver.train(epochs=10, lr=1e-3)
+    history = solver.train(epochs=1000, lr=1e-3)
     # 可视化损失
     plot_history(history)
     # 残差平面展示
