@@ -379,7 +379,7 @@ if __name__ == "__main__":
     # 定义固定时刻（例如，在时间域 [0, T] 内均匀分布的 n 个时刻）
     fixed_times = np.linspace(0.2*T, 0.6*T, 3)  # 固定时刻
     # 定义每个固定时刻的空间采样点数量
-    num_spatial_points_per_time = 1000
+    num_spatial_points_per_time = 10000
     # 生成空间采样点
     spatial_points = geom.uniform_points(num_spatial_points_per_time)
     # 将空间采样点与固定时刻组合
@@ -393,8 +393,8 @@ if __name__ == "__main__":
     # 学习率
     lr = 1e-3
     # 损失权重
-    loss_PDE_real = 1e-2
-    loss_PDE_imag = 1e-2
+    loss_PDE_real = 1e-3
+    loss_PDE_imag = 1e-3
     loss_nomr = 1.0
     loss_IC_real = 1.0
     loss_IC_imag = 1.0
@@ -404,11 +404,11 @@ if __name__ == "__main__":
     r0 = th.tensor([-R, 0.0, 0.0]) # 起始坐标
     delta = th.tensor(1.0) # 波包宽度参数
     m = th.tensor(1.0) # 质量
-    num_domain = 1000 # 球内采样
+    num_domain = 10000 # 球内采样
     num_initial = 1000 # 起始采样
-    num_test = 1000 # 测试点
+    num_test = 10000 # 测试点
 
-    iterations = 5 # 训练轮数
+    iterations = 100 # 训练轮数
     solver = SchrodingerEquationSolver(space_time, k, r0, delta, m, R, T, num_domain, num_initial, num_test, iterations,
                                        norm_samples, fixed_times, num_spatial_points_per_time,
                                        loss_PDE_real, loss_PDE_imag, loss_nomr, loss_IC_real, loss_IC_imag, lr)
