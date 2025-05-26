@@ -38,7 +38,7 @@ class PINN3DSpherical(nn.Module):
 
 # 求解器
 class Solver3DSpherical:
-    def __init__(self, model, X0, U0, V0, X_f, X1, mean_density):
+    def __init__(self, model, X0, U0, V0, X_f, arrays, mean_density):
         self.model = model.to(device)
         # 初始时刻归一化数值
         self.mean_density = mean_density
@@ -54,13 +54,8 @@ class Solver3DSpherical:
         self.thetaf = torch.tensor(X_f[:, 1:2], dtype=torch.float32, device=device, requires_grad=True)
         self.phif = torch.tensor(X_f[:, 2:3], dtype=torch.float32, device=device, requires_grad=True)
         self.tf = torch.tensor(X_f[:, 3:4], dtype=torch.float32, device=device, requires_grad=True)
-        # 其他时刻归一化数据点
-        self.r1 = torch.tensor(X1[:, 0:1], dtype=torch.float32, device=device, requires_grad=True)
-        self.theta1 = torch.tensor(X1[:, 1:2], dtype=torch.float32, device=device, requires_grad=True)
-        self.phi1 = torch.tensor(X1[:, 2:3], dtype=torch.float32, device=device, requires_grad=True)
-        self.t1 = torch.tensor(X1[:, 3:4], dtype=torch.float32, device=device, requires_grad=True)
 
-
+        self.arrays = arrays
     def schrodinger_residual(self):
 
         psi_r, psi_i = self.model(self.rf, self.thetaf, self.phif, self.tf)
@@ -119,25 +114,34 @@ class Solver3DSpherical:
         return res_r, res_i
 
     def loss(self):
+        # 其他时刻归一化数据点
+        mse_norm = []
+        for i in range (len(self.arrays)):
+            r_norm = torch.tensor(arrays[i][:, 0:1], dtype=torch.float32, device=device, requires_grad=True)
+            theta_norm = torch.tensor(arrays[i][:, 1:2], dtype=torch.float32, device=device, requires_grad=True)
+            phi_norm = torch.tensor(arrays[i][:, 2:3], dtype=torch.float32, device=device, requires_grad=True)
+            t_norm = torch.tensor(arrays[i][:, 3:4], dtype=torch.float32, device=device, requires_grad=True)
+            # 归一化损失
+            psi_r, psi_i = self.model(r_norm, theta_norm, phi_norm, t_norm)
+            density_norm = psi_r ** 2 + psi_i ** 2
+            mean_density_norm = torch.sqrt(torch.sum(density_norm))
+            current_mse_norm = (mean_density_norm - self.mean_density)**2
+            mse_norm.append(current_mse_norm)
+        mse_norm_total = torch.stack(mse_norm).sum()
         # 初始条件损失
         u0_pred, v0_pred = self.model(self.r0, self.theta0, self.phi0, self.t0)
         mse_ic = torch.mean((u0_pred - self.u0)**2) + torch.mean((v0_pred - self.v0)**2)
-        # 归一化损失
-        psi_r, psi_i = self.model(self.r1, self.theta1, self.phi1, self.t1)
-        density1 = psi_r ** 2 + psi_i ** 2
-        mean_density1 = torch.sqrt(torch.sum(density1))
-        mse_norm = (mean_density1 - self.mean_density)**2
         # 残差
         res_r, res_i = self.schrodinger_residual()
         mse_pde = torch.mean(res_r**2) + torch.mean(res_i**2)
-        lr_ic = 1
-        lr_pde = 1e-3
-        lr_norm = 1e-3
+        lr_ic = 1.0
+        lr_pde = 1.0
+        lr_norm = 1.0
         mse_ic = mse_ic * lr_ic
         mse_pde = mse_pde * lr_pde
-        mse_norm = mse_norm * lr_norm
-        loss = mse_ic + mse_pde + mse_norm
-        return loss, mse_ic, mse_pde, mse_norm
+        mse_norm_total = mse_norm_total * lr_norm
+        loss = mse_ic + mse_pde + mse_norm_total
+        return loss, mse_ic, mse_pde, mse_norm_total
 
     def train(self, epochs, lr=1e-3):
         optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
@@ -423,11 +427,20 @@ if __name__ == '__main__':
     ub0 = np.array([R, np.pi, 2 * np.pi, 0])
     N0 = 1000
     X0 = lb + (ub0 - lb) * lhs(4, N0)
-    # 定义其他时刻归一化数据
+    # 定义其他时刻 100 个数组归一化数据
     ub1 = np.array([R, np.pi, 2 * np.pi, 0.5])
     N1 = 1000
-    X1 = lb + (ub1 - lb) * lhs(4, N1)
-    X1[:, 3] = 0.5
+    t_values = np.linspace(0, 1, 100)
+
+    arrays = []
+    for i in range(100):
+        # 拉丁超立方采样生成初始数据
+        sample = lhs(4, samples=1000)  # 4 维，1000 个样本点
+        X = lb + (ub1 - lb) * sample  # 将采样点映射到指定的边界范围内
+        # 将当前数组的第三列设置为均匀分布的值
+        X[:, 3] = t_values[i]  # 第三列的索引是 2
+        arrays.append(X)
+
     # 初始条件
     U0, V0 = initial_wave_spherical(k, R0, X0, delta)
     mean_density = calculate_norm(U0, V0)
@@ -435,7 +448,7 @@ if __name__ == '__main__':
     # 网络配置
     layers = [4, 128, 128, 128, 2]
     model = PINN3DSpherical(layers)
-    solver = Solver3DSpherical(model, X0, U0, V0, X_f, X1, mean_density)
+    solver = Solver3DSpherical(model, X0, U0, V0, X_f, arrays, mean_density)
     # 训练
     history = solver.train(epochs=1000, lr=1e-3)
     # 可视化损失
