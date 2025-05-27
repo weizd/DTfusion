@@ -49,37 +49,39 @@ class Solver3DSpherical:
         self.t0 = torch.tensor(X0[:, 3:4], dtype=torch.float32, device=device)
         self.u0 = torch.tensor(U0, dtype=torch.float32, device=device)
         self.v0 = torch.tensor(V0, dtype=torch.float32, device=device)
-        # 残差点
-        self.rf = torch.tensor(X_f[:, 0:1], dtype=torch.float32, device=device, requires_grad=True)
-        self.thetaf = torch.tensor(X_f[:, 1:2], dtype=torch.float32, device=device, requires_grad=True)
-        self.phif = torch.tensor(X_f[:, 2:3], dtype=torch.float32, device=device, requires_grad=True)
-        self.tf = torch.tensor(X_f[:, 3:4], dtype=torch.float32, device=device, requires_grad=True)
-
+        # 原始大数量数组
+        self.data = X_f
+        # 其他时刻归一化数据集合
         self.arrays = arrays
-    def schrodinger_residual(self):
 
-        psi_r, psi_i = self.model(self.rf, self.thetaf, self.phif, self.tf)
+    def schrodinger_residual(self, batch_data):
+        # 残差点
+        rf = torch.tensor(batch_data[:, 0:1], dtype=torch.float32, device=device, requires_grad=True)
+        thetaf = torch.tensor(batch_data[:, 1:2], dtype=torch.float32, device=device, requires_grad=True)
+        phif = torch.tensor(batch_data[:, 2:3], dtype=torch.float32, device=device, requires_grad=True)
+        tf = torch.tensor(batch_data[:, 3:4], dtype=torch.float32, device=device, requires_grad=True)
+        psi_r, psi_i = self.model(rf, thetaf, phif, tf)
         # 一阶导数
         grads = torch.autograd.grad(
-            psi_r, [self.rf, self.thetaf, self.phif, self.tf],
+            psi_r, [rf, thetaf, phif, tf],
             grad_outputs=torch.ones_like(psi_r), create_graph=True
         ) + torch.autograd.grad(
-            psi_i, [self.rf, self.thetaf, self.phif, self.tf],
+            psi_i, [rf, thetaf, phif, tf],
             grad_outputs=torch.ones_like(psi_i), create_graph=True
         )
         psi_r_r, psi_r_th, psi_r_p, psi_r_t, psi_i_r, psi_i_th, psi_i_p, psi_i_t = grads
         # 二阶导数
-        psi_r_rr = torch.autograd.grad(psi_r_r, self.rf, grad_outputs=torch.ones_like(psi_r_r), create_graph=True)[0]
-        psi_r_thth = torch.autograd.grad(psi_r_r, self.thetaf, grad_outputs=torch.ones_like(psi_r_r), create_graph=True)[0]
-        psi_r_pp = torch.autograd.grad(psi_r_r, self.phif, grad_outputs=torch.ones_like(psi_r_r), create_graph=True)[0]
+        psi_r_rr = torch.autograd.grad(psi_r_r, rf, grad_outputs=torch.ones_like(psi_r_r), create_graph=True)[0]
+        psi_r_thth = torch.autograd.grad(psi_r_r, thetaf, grad_outputs=torch.ones_like(psi_r_r), create_graph=True)[0]
+        psi_r_pp = torch.autograd.grad(psi_r_r, phif, grad_outputs=torch.ones_like(psi_r_r), create_graph=True)[0]
 
-        psi_i_rr = torch.autograd.grad(psi_i_r, self.rf, grad_outputs=torch.ones_like(psi_i_r), create_graph=True)[0]
-        psi_i_thth = torch.autograd.grad(psi_i_r, self.thetaf, grad_outputs=torch.ones_like(psi_i_r), create_graph=True)[0]
-        psi_i_pp = torch.autograd.grad(psi_i_r, self.phif, grad_outputs=torch.ones_like(psi_i_r), create_graph=True)[0]
+        psi_i_rr = torch.autograd.grad(psi_i_r, rf, grad_outputs=torch.ones_like(psi_i_r), create_graph=True)[0]
+        psi_i_thth = torch.autograd.grad(psi_i_r, thetaf, grad_outputs=torch.ones_like(psi_i_r), create_graph=True)[0]
+        psi_i_pp = torch.autograd.grad(psi_i_r, phif, grad_outputs=torch.ones_like(psi_i_r), create_graph=True)[0]
 
         # 坐标分量
-        r = self.rf
-        theta = self.thetaf
+        r = rf
+        theta = thetaf
         sin_t = torch.sin(theta)
         sin2_t = sin_t ** 2
 
@@ -113,7 +115,7 @@ class Solver3DSpherical:
 
         return res_r, res_i
 
-    def loss(self):
+    def loss(self, batch_data):
         # 其他时刻归一化数据点
         mse_norm = []
         for i in range (len(self.arrays)):
@@ -132,7 +134,7 @@ class Solver3DSpherical:
         u0_pred, v0_pred = self.model(self.r0, self.theta0, self.phi0, self.t0)
         mse_ic = torch.mean((u0_pred - self.u0)**2) + torch.mean((v0_pred - self.v0)**2)
         # 残差
-        res_r, res_i = self.schrodinger_residual()
+        res_r, res_i = self.schrodinger_residual(batch_data)
         mse_pde = torch.mean(res_r**2) + torch.mean(res_i**2)
         lr_ic = 1.0
         lr_pde = 1.0
@@ -143,26 +145,77 @@ class Solver3DSpherical:
         loss = mse_ic + mse_pde + mse_norm_total
         return loss, mse_ic, mse_pde, mse_norm_total
 
-    def train(self, epochs, lr=1e-3):
+    # def train(self, epochs, lr=1e-3):
+    #     optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
+    #     scheduler = ReduceLROnPlateau(optimizer, factor=0.5, patience=100, verbose=True)
+    #     history = {'loss': [], 'ic': [], 'pde': [], 'norm': []}
+    #     start = time()
+    #     for ep in range(1, epochs+1):
+    #         optimizer.zero_grad()
+    #         loss, ic, pde, norm = self.loss()
+    #         loss.backward()
+    #         optimizer.step()
+    #         scheduler.step(loss)
+    #         history['loss'].append(loss.item())
+    #         history['ic'].append(ic.item())
+    #         history['pde'].append(pde.item())
+    #         history['norm'].append(norm.item())
+    #         if ep % 1 == 0:
+    #             print(f"Epoch {ep}/{epochs}, Loss: {loss.item():.4e}, IC: {ic.item():.4e}, PDE: {pde.item():.4e}, norm: {norm.item():.4e}")
+    #     print(f"Training completed in {time()-start:.1f}s")
+    #     return history
+
+    def train(self, epochs, lr=1e-3, batch_size=256):
         optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
         scheduler = ReduceLROnPlateau(optimizer, factor=0.5, patience=100, verbose=True)
         history = {'loss': [], 'ic': [], 'pde': [], 'norm': []}
         start = time()
-        for ep in range(1, epochs+1):
-            optimizer.zero_grad()
-            loss, ic, pde, norm = self.loss()
-            loss.backward()
-            optimizer.step()
-            scheduler.step(loss)
-            history['loss'].append(loss.item())
-            history['ic'].append(ic.item())
-            history['pde'].append(pde.item())
-            history['norm'].append(norm.item())
+
+        # 假设 self.data 包含训练所需的所有数据
+        # 并且 self.data 是一个列表，其中每个元素是一个批次的数据
+        # 如果不是，需要根据实际情况进行调整
+        data = self.data  # 获取所有训练数据
+
+        # 计算批次数量
+        num_batches = len(data) // batch_size
+
+        for ep in range(1, epochs + 1):
+            # 在每个 epoch 开始时重置批次索引
+            batch_indices = np.arange(len(data))
+            np.random.shuffle(batch_indices)
+
+            for batch_idx in range(num_batches):
+                # 获取当前批次的索引
+                start_idx = batch_idx * batch_size
+                end_idx = (batch_idx + 1) * batch_size
+
+                # 获取当前批次的数据
+                # batch_data = [data[i] for i in batch_indices[start_idx:end_idx]]
+                batch_data = data[batch_indices[start_idx:end_idx]]
+                optimizer.zero_grad()
+
+                # 计算当前批次的损失
+                loss, ic, pde, norm = self.loss(batch_data)
+
+                loss.backward()
+                optimizer.step()
+
+            # 使用整个数据集的损失来更新学习率调度器
+            # 计算整个数据集的损失
+            total_loss, total_ic, total_pde, total_norm = self.loss(data)
+            scheduler.step(total_loss)
+
+            # 记录历史信息
+            history['loss'].append(total_loss.item())
+            history['ic'].append(total_ic.item())
+            history['pde'].append(total_pde.item())
+            history['norm'].append(total_norm.item())
+
             if ep % 1 == 0:
-                print(f"Epoch {ep}/{epochs}, Loss: {loss.item():.4e}, IC: {ic.item():.4e}, PDE: {pde.item():.4e}, norm: {norm.item():.4e}")
+                print(f"Epoch {ep}/{epochs}, Loss: {total_loss.item():.4e}, IC: {total_ic.item():.4e}, PDE: {total_pde.item():.4e}, norm: {total_norm.item():.4e}")
+
         print(f"Training completed in {time()-start:.1f}s")
         return history
-
 def analytic_solution_polar(k, R0, X_f, delta=1, m=1):
     # 自由粒子在三维极坐标下高斯波包的解析解（Hartree 单位制：ℏ=1, m=1）。
     # x: (N,4) -> [r, θ, φ, t]
@@ -295,25 +348,6 @@ def plot_history(history, save_path=None):
     # 显示图表
     plt.show()
 
-# 残差可视化示例（r-t 平面切片）
-def plot_residual_slice(solver, r_vals, t_vals):
-    R, T = np.meshgrid(r_vals, t_vals)
-    X = np.hstack((R.flatten()[:,None], (np.pi/6)*np.ones((R.size,1)), np.zeros((R.size,1)), T.flatten()[:,None]))
-    rf = torch.tensor(X[:,0:1], dtype=torch.float32, device=device, requires_grad=True)
-    thf = torch.tensor(X[:,1:2], dtype=torch.float32, device=device, requires_grad=True)
-    phf = torch.tensor(X[:,2:3], dtype=torch.float32, device=device, requires_grad=True)
-    tf = torch.tensor(X[:,3:4], dtype=torch.float32, device=device, requires_grad=True)
-    solver.rf, solver.thetaf, solver.phif, solver.tf = rf, thf, phf, tf
-    res_r, res_i = solver.schrodinger_residual()
-    res = (res_r.pow(2) + res_i.pow(2)).detach().cpu().numpy().reshape(R.shape)
-    plt.figure()
-    im = plt.imshow(res, origin='lower', extent=[r_vals.min(), r_vals.max(), t_vals.min(), t_vals.max()], aspect='auto')
-    plt.xlabel('r')
-    plt.ylabel('t')
-    plt.title('Residual magnitude')
-    plt.colorbar(im)
-    plt.show()
-
 # 测试点 只看 φ=pi/6; θ=0; t=0.5截面
 def predict_and_plot(solver, R, k, R0):
     N = 100
@@ -431,16 +465,14 @@ if __name__ == '__main__':
     ub1 = np.array([R, np.pi, 2 * np.pi, 0.5])
     N1 = 1000
     t_values = np.linspace(0, 1, 100)
-
     arrays = []
     for i in range(100):
         # 拉丁超立方采样生成初始数据
         sample = lhs(4, samples=1000)  # 4 维，1000 个样本点
         X = lb + (ub1 - lb) * sample  # 将采样点映射到指定的边界范围内
-        # 将当前数组的第三列设置为均匀分布的值
-        X[:, 3] = t_values[i]  # 第三列的索引是 2
+        # 将当前数组的第四列设置为均匀分布的值
+        X[:, 3] = t_values[i]
         arrays.append(X)
-
     # 初始条件
     U0, V0 = initial_wave_spherical(k, R0, X0, delta)
     mean_density = calculate_norm(U0, V0)
@@ -450,13 +482,10 @@ if __name__ == '__main__':
     model = PINN3DSpherical(layers)
     solver = Solver3DSpherical(model, X0, U0, V0, X_f, arrays, mean_density)
     # 训练
-    history = solver.train(epochs=1000, lr=1e-3)
+    history = solver.train(epochs=2, lr=1e-3)
     # 可视化损失
     plot_history(history)
-    # 残差平面展示
-    r_vals = np.linspace(0.1, R,100)
-    t_vals = np.linspace(0, t,100)
-    plot_residual_slice(solver, r_vals, t_vals)
+
     # 测试点 只看 φ=pi/6; θ=0; t=0.5截面
     predict_and_plot(solver, R, k, R0)
     # 绘制 φ=pi/6; θ=0全时空实部、虚部和振幅偏差
