@@ -10,6 +10,7 @@ from pyDOE import lhs
 
 # 设置设备
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
+print("device:", device)
 
 # PINN 网络结构
 class PINN3DSpherical(nn.Module):
@@ -47,8 +48,10 @@ class Solver3DSpherical:
         self.theta0 = torch.tensor(X0[:, 1:2], dtype=torch.float32, device=device)
         self.phi0 = torch.tensor(X0[:, 2:3], dtype=torch.float32, device=device)
         self.t0 = torch.tensor(X0[:, 3:4], dtype=torch.float32, device=device)
-        self.u0 = torch.tensor(U0, dtype=torch.float32, device=device)
-        self.v0 = torch.tensor(V0, dtype=torch.float32, device=device)
+        self.u0 = U0.clone().detach().to(dtype=torch.float32, device=device)
+        self.v0 = V0.clone().detach().to(dtype=torch.float32, device=device)
+        # self.u0 = torch.tensor(U0, dtype=torch.float32, device=device)
+        # self.v0 = torch.tensor(V0, dtype=torch.float32, device=device)
         # 原始大数量数组
         self.data = X_f
         # 其他时刻归一化数据集合
@@ -103,7 +106,7 @@ class Solver3DSpherical:
         )
         # 实/虚部残差： iψ_t + ½Δψ = 0
         res_r = psi_i_t - 0.5 * lap_r
-        # res_r_num = res_r.detach().numpy()
+        res_r_num = res_r.cpu().detach().numpy()
         res_i = -psi_r_t - 0.5 * lap_i
 
         threshold = 1e2
@@ -165,7 +168,7 @@ class Solver3DSpherical:
     #     print(f"Training completed in {time()-start:.1f}s")
     #     return history
 
-    def train(self, epochs, lr=1e-3, batch_size=256):
+    def train(self, epochs, lr=1e-3, batch_size=128):
         optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
         scheduler = ReduceLROnPlateau(optimizer, factor=0.5, patience=100, verbose=True)
         history = {'loss': [], 'ic': [], 'pde': [], 'norm': []}
@@ -190,7 +193,6 @@ class Solver3DSpherical:
                 end_idx = (batch_idx + 1) * batch_size
 
                 # 获取当前批次的数据
-                # batch_data = [data[i] for i in batch_indices[start_idx:end_idx]]
                 batch_data = data[batch_indices[start_idx:end_idx]]
                 optimizer.zero_grad()
 
@@ -271,8 +273,8 @@ def analytic_solution_polar(k, R0, X_f, delta=1, m=1):
     )
     # 7. 构造解析解
     psi = norm * torch.exp(-dx2 / (4 * sigma) + 1j * phase_arg)
-    psi_real = psi.real.detach().numpy()
-    psi_imag = psi.imag.detach().numpy()
+    psi_real = psi.real.cpu().detach().numpy()
+    psi_imag = psi.imag.cpu().detach().numpy()
 
     return psi_real, psi_imag
 
@@ -367,8 +369,8 @@ def predict_and_plot(solver, R, k, R0):
     phf = torch.tensor(r_phi_theta_test[:,2:3], dtype=torch.float32, device=device, requires_grad=True)
     tf = torch.tensor(r_phi_theta_test[:,3:4], dtype=torch.float32, device=device, requires_grad=True)
     psi_pinn_real, psi_pinn_imag = solver.model(rf, thf, phf, tf)
-    psi_pinn_real =psi_pinn_real.detach().numpy()
-    psi_pinn_imag = psi_pinn_imag.detach().numpy()
+    psi_pinn_real =psi_pinn_real.cpu().detach().numpy()
+    psi_pinn_imag = psi_pinn_imag.cpu().detach().numpy()
     # 绘图对比
     plt.figure(figsize=(8, 4))
     plt.plot(r, psi_exact_real, '--', label='Analytic Real', color='red', linewidth=2)
@@ -405,8 +407,8 @@ def calculate_and_plot_diffs(solver, R, k, R0):
         phf = torch.tensor(r_phi_theta_test_all[:, 2:3], dtype=torch.float32, device=device, requires_grad=True)
         tf = torch.tensor(r_phi_theta_test_all[:, 3:4], dtype=torch.float32, device=device, requires_grad=True)
         psi_pinn_real, psi_pinn_imag = solver.model(rf, thf, phf, tf)
-        psi_pinn_real = psi_pinn_real.detach().numpy()
-        psi_pinn_imag = psi_pinn_imag.detach().numpy()
+        psi_pinn_real = psi_pinn_real.cpu().detach().numpy()
+        psi_pinn_imag = psi_pinn_imag.cpu().detach().numpy()
 
         psi_exact_real, psi_exact_imag = analytic_solution_polar(k, R0, r_phi_theta_test_all)
         psi_pinn = psi_pinn_real + 1j * psi_pinn_imag
@@ -455,7 +457,7 @@ if __name__ == '__main__':
     lb = np.array([0.0, 0.0, 0.0, 0.0])       # r>=0, theta>=0, phi>=0, t>=0
     # 定义所有训练点数据
     ub = np.array([R, np.pi, 2*np.pi, t])
-    Nf = 20000
+    Nf = 2000
     X_f = lb + (ub - lb) * lhs(4, Nf)
     # 定义初始时刻数据
     ub0 = np.array([R, np.pi, 2 * np.pi, 0])
