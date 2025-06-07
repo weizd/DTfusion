@@ -39,7 +39,7 @@ class PINN3DSpherical(nn.Module):
 
 # 求解器
 class Solver3DSpherical:
-    def __init__(self, model, X0, U0, V0, X_f, arrays, mean_density):
+    def __init__(self, model, X0, U0, V0, X_f, arrays, mean_density, X2, U2, V2):
         self.model = model.to(device)
         # 初始时刻归一化数值
         self.mean_density = mean_density
@@ -50,8 +50,13 @@ class Solver3DSpherical:
         self.t0 = torch.tensor(X0[:, 3:4], dtype=torch.float32, device=device)
         self.u0 = U0.clone().detach().to(dtype=torch.float32, device=device)
         self.v0 = V0.clone().detach().to(dtype=torch.float32, device=device)
-        # self.u0 = torch.tensor(U0, dtype=torch.float32, device=device)
-        # self.v0 = torch.tensor(V0, dtype=torch.float32, device=device)
+        # 解析解引导数据
+        self.r2 = torch.tensor(X2[:, 0:1], dtype=torch.float32, device=device)
+        self.theta2 = torch.tensor(X2[:, 1:2], dtype=torch.float32, device=device)
+        self.phi2 = torch.tensor(X2[:, 2:3], dtype=torch.float32, device=device)
+        self.t2 = torch.tensor(X2[:, 3:4], dtype=torch.float32, device=device)
+        self.u2 = U2.clone().detach().to(dtype=torch.float32, device=device)
+        self.v2 = V2.clone().detach().to(dtype=torch.float32, device=device)
         # 原始大数量数组
         self.data = X_f
         # 其他时刻归一化数据集合
@@ -106,7 +111,7 @@ class Solver3DSpherical:
         )
         # 实/虚部残差： iψ_t + ½Δψ = 0
         res_r = psi_i_t - 0.5 * lap_r
-        res_r_num = res_r.cpu().detach().numpy()
+        # res_r_num = res_r.cpu().detach().numpy()
         res_i = -psi_r_t - 0.5 * lap_i
 
         threshold = 1e2
@@ -136,22 +141,27 @@ class Solver3DSpherical:
         # 初始条件损失
         u0_pred, v0_pred = self.model(self.r0, self.theta0, self.phi0, self.t0)
         mse_ic = torch.mean((u0_pred - self.u0)**2) + torch.mean((v0_pred - self.v0)**2)
+        # 解析解引导数据损失
+        u2_pred, v2_pred = self.model(self.r2, self.theta2, self.phi2, self.t2)
+        mse_ana = torch.mean((u2_pred - self.u2)**2) + torch.mean((v2_pred - self.v2)**2)
         # 残差
         res_r, res_i = self.schrodinger_residual(batch_data)
         mse_pde = torch.mean(res_r**2) + torch.mean(res_i**2)
         lr_ic = 1.0
         lr_pde = 1.0
         lr_norm = 1.0
+        lr_ana = 1.0
         mse_ic = mse_ic * lr_ic
         mse_pde = mse_pde * lr_pde
         mse_norm_total = mse_norm_total * lr_norm
-        loss = mse_ic + mse_pde + mse_norm_total
-        return loss, mse_ic, mse_pde, mse_norm_total
+        mse_ana = mse_ana * lr_ana
+        loss = mse_ic + mse_pde + mse_norm_total + mse_ana
+        return loss, mse_ic, mse_pde, mse_norm_total, mse_ana
 
     def train(self, epochs, lr, initial_batch_size):
         optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
         scheduler = ReduceLROnPlateau(optimizer, factor=0.5, patience=100, verbose=True)
-        history = {'loss': [], 'ic': [], 'pde': [], 'norm': []}
+        history = {'loss': [], 'ic': [], 'pde': [], 'norm': [], 'ana': []}
         start = time()
 
         # self.data 包含训练所需的所有数据
@@ -160,8 +170,8 @@ class Solver3DSpherical:
         # 定义 batch_size 的调整计划
         batch_size_schedule = {
             0: initial_batch_size,  # 起始 batch_size
-            400: initial_batch_size // 2,  # batch_size 减半
-            800: initial_batch_size // 4,  # batch_size 再减半
+            500: initial_batch_size // 2,  # batch_size 减半
+            1000: initial_batch_size // 4,  # batch_size 再减半
         }
 
         for ep in range(1, epochs + 1):
@@ -190,14 +200,14 @@ class Solver3DSpherical:
                 optimizer.zero_grad()
 
                 # 计算当前批次的损失
-                loss, ic, pde, norm = self.loss(batch_data)
+                loss, ic, pde, norm, ana = self.loss(batch_data)
 
                 loss.backward()
                 optimizer.step()
 
             # 使用整个数据集的损失来更新学习率调度器
             # 计算整个数据集的损失
-            total_loss, total_ic, total_pde, total_norm = self.loss(data)
+            total_loss, total_ic, total_pde, total_norm, total_ana = self.loss(data)
             scheduler.step(total_loss)
 
             # 记录历史信息
@@ -205,33 +215,35 @@ class Solver3DSpherical:
             history['ic'].append(total_ic.item())
             history['pde'].append(total_pde.item())
             history['norm'].append(total_norm.item())
+            history['ana'].append(total_ana.item())
 
             if ep % 1 == 0:
                 print(
-                    f"Epoch {ep}/{epochs}, Batch Size: {current_batch_size}, Loss: {total_loss.item():.4e}, IC: {total_ic.item():.4e}, PDE: {total_pde.item():.4e}, norm: {total_norm.item():.4e}")
+                    f"Epoch {ep}/{epochs}, Batch Size: {current_batch_size}, Loss: {total_loss.item():.4e}, IC: {total_ic.item():.4e},"
+                    f" PDE: {total_pde.item():.4e}, norm: {total_norm.item():.4e}, ana: {total_ana.item():.4e}")
 
         print(f"Training completed in {time() - start:.1f}s")
         return history
 
 
-def analytic_solution_polar(k, R0, X_f, delta=1, m=1):
+def analytic_solution_polar(K, R, X, delta=1, m=1):
     # 自由粒子在三维极坐标下高斯波包的解析解（Hartree 单位制：ℏ=1, m=1）。
     # x: (N,4) -> [r, θ, φ, t]
     # k: (N,3) -> [k0, θ0, φ0]
     # r0: 默认与r方向一致
     delta = torch.tensor(delta, dtype=torch.float32, device=device)
-    k0 = torch.tensor(k[0], dtype=torch.float32, device=device)
-    theta_k = torch.tensor(k[1], dtype=torch.float32, device=device)
-    phi_k = torch.tensor(k[2], dtype=torch.float32, device=device)
+    k0 = torch.tensor(K[0], dtype=torch.float32, device=device)
+    theta_k = torch.tensor(K[1], dtype=torch.float32, device=device)
+    phi_k = torch.tensor(K[2], dtype=torch.float32, device=device)
 
-    r = torch.tensor(X_f[:, 0:1], dtype=torch.float32, device=device, requires_grad=True)
-    theta_r = torch.tensor(X_f[:, 1:2], dtype=torch.float32, device=device, requires_grad=True)
-    phi_r = torch.tensor(X_f[:, 2:3], dtype=torch.float32, device=device, requires_grad=True)
-    t = torch.tensor(X_f[:, 3:4], dtype=torch.float32, device=device, requires_grad=True)
+    r = torch.tensor(X[:, 0:1], dtype=torch.float32, device=device, requires_grad=True)
+    theta_r = torch.tensor(X[:, 1:2], dtype=torch.float32, device=device, requires_grad=True)
+    phi_r = torch.tensor(X[:, 2:3], dtype=torch.float32, device=device, requires_grad=True)
+    t = torch.tensor(X[:, 3:4], dtype=torch.float32, device=device, requires_grad=True)
 
-    r0 = torch.tensor(R0[0], dtype=torch.float32, device=device)
-    theta_r0 = torch.tensor(R0[1], dtype=torch.float32, device=device)
-    phi_r0 = torch.tensor(R0[2], dtype=torch.float32, device=device)
+    r0 = torch.tensor(R[0], dtype=torch.float32, device=device)
+    theta_r0 = torch.tensor(R[1], dtype=torch.float32, device=device)
+    phi_r0 = torch.tensor(R[2], dtype=torch.float32, device=device)
 
     # 1. 宽度演化 σ = Δ^2 + i t / (2m)
     sigma = delta ** 2 + 1j * t / (2 * m)
@@ -269,8 +281,8 @@ def analytic_solution_polar(k, R0, X_f, delta=1, m=1):
     )
     # 7. 构造解析解
     psi = norm * torch.exp(-dx2 / (4 * sigma) + 1j * phase_arg)
-    psi_real = psi.real.cpu().detach().numpy()
-    psi_imag = psi.imag.cpu().detach().numpy()
+    psi_real = psi.real
+    psi_imag = psi.imag
 
     return psi_real, psi_imag
 
@@ -325,11 +337,11 @@ def plot_history(history, save_path=None):
     # 创建一个新的图形
     plt.figure(figsize=(10, 6))  # 设置图形大小
     # 定义颜色和线条样式
-    colors = ['blue', 'green', 'red', 'purple']
-    line_styles = ['-', '--', '-.', ':']
+    colors = ['blue', 'green', 'red', 'purple', 'black']
+    line_styles = ['-', '--', '-.', ':', '-.']
     # 绘制每种损失曲线
-    loss_labels = ['Total Loss', 'IC Loss', 'PDE Loss', 'Norm Loss']
-    for i, (key, label) in enumerate(zip(['loss', 'ic', 'pde', 'norm'], loss_labels)):
+    loss_labels = ['Total Loss', 'IC Loss', 'PDE Loss', 'Norm Loss', 'Ana Loss']
+    for i, (key, label) in enumerate(zip(['loss', 'ic', 'pde', 'norm', 'ana'], loss_labels)):
         # 确保历史记录中有这个键
         if key in history:
             plt.semilogy(history[key], label=label, color=colors[i % len(colors)], linestyle=line_styles[i % len(line_styles)], linewidth=2)
@@ -359,6 +371,8 @@ def predict_and_plot(solver, R, k, R0):
     r_phi_theta_test = np.vstack([r, theta_test, phi_test, t_test]).T
     # 解析解
     psi_exact_real, psi_exact_imag = analytic_solution_polar(k, R0, r_phi_theta_test)
+    psi_exact_real =psi_exact_real.cpu().detach().numpy()
+    psi_exact_imag = psi_exact_imag.cpu().detach().numpy()
     # PINN 预测
     rf = torch.tensor(r_phi_theta_test[:,0:1], dtype=torch.float32, device=device, requires_grad=True)
     thf = torch.tensor(r_phi_theta_test[:,1:2], dtype=torch.float32, device=device, requires_grad=True)
@@ -407,6 +421,8 @@ def calculate_and_plot_diffs(solver, R, k, R0):
         psi_pinn_imag = psi_pinn_imag.cpu().detach().numpy()
 
         psi_exact_real, psi_exact_imag = analytic_solution_polar(k, R0, r_phi_theta_test_all)
+        psi_exact_real = psi_exact_real.cpu().detach().numpy()
+        psi_exact_imag = psi_exact_imag.cpu().detach().numpy()
         psi_pinn = psi_pinn_real + 1j * psi_pinn_imag
         psi_exact = psi_exact_real + 1j * psi_exact_imag
 
@@ -453,11 +469,11 @@ if __name__ == '__main__':
     lb = np.array([0.0, 0.0, 0.0, 0.0])       # r>=0, theta>=0, phi>=0, t>=0
     # 定义所有训练点数据
     ub = np.array([R, np.pi, 2*np.pi, t])
-    Nf = 20000
+    Nf = 30000
     X_f = lb + (ub - lb) * lhs(4, Nf)
     # 定义初始时刻数据
     ub0 = np.array([R, np.pi, 2 * np.pi, 0])
-    N0 = 1000
+    N0 = 10000
     X0 = lb + (ub0 - lb) * lhs(4, N0)
     # 定义其他时刻 100 个数组归一化数据
     ub1 = np.array([R, np.pi, 2 * np.pi, 0.5])
@@ -471,16 +487,24 @@ if __name__ == '__main__':
         # 将当前数组的第四列设置为均匀分布的值
         X[:, 3] = t_values[i]
         arrays.append(X)
+    # 定义解析解引导数据
+    ub2 = np.array([R, np.pi, 2 * np.pi, t])
+    N2 = 30000
+    X2 = lb + (ub2 - lb) * lhs(4, N2)
+    U2, V2 = analytic_solution_polar(k, R0, X2)
+    ana_mean_density = calculate_norm(U2, V2)
     # 初始条件
     U0, V0 = initial_wave_spherical(k, R0, X0, delta)
     mean_density = calculate_norm(U0, V0)
+    print("ana_mean_density - mean_density =", ana_mean_density - mean_density)
+
 
     # 网络配置
     layers = [4, 128, 128, 128, 2]
     model = PINN3DSpherical(layers)
-    solver = Solver3DSpherical(model, X0, U0, V0, X_f, arrays, mean_density)
+    solver = Solver3DSpherical(model, X0, U0, V0, X_f, arrays, mean_density, X2, U2, V2)
     # 训练
-    history = solver.train(epochs=1000, lr=1e-3, initial_batch_size=20000)
+    history = solver.train(epochs=200, lr=1e-2, initial_batch_size=30000)
     # 可视化损失
     plot_history(history)
 
