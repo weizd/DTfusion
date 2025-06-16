@@ -19,7 +19,7 @@ class PINN3DSpherical(nn.Module):
         seq = []
         for i in range(len(layers) - 2):
             seq.append(nn.Linear(layers[i], layers[i+1]))
-            seq.append(nn.Tanh())
+            seq.append(nn.ReLU())
         seq.append(nn.Linear(layers[-2], layers[-1]))
         self.net = nn.Sequential(*seq)
         self._init_weights()
@@ -147,10 +147,10 @@ class Solver3DSpherical:
         # 残差
         res_r, res_i = self.schrodinger_residual(batch_data)
         mse_pde = torch.mean(res_r**2) + torch.mean(res_i**2)
-        lr_ic = 1.0
+        lr_ic = 1e3
         lr_pde = 1.0
-        lr_norm = 1.0
-        lr_ana = 1.0
+        lr_norm = 1e-10
+        lr_ana = 1e-10
         mse_ic = mse_ic * lr_ic
         mse_pde = mse_pde * lr_pde
         mse_norm_total = mse_norm_total * lr_norm
@@ -463,7 +463,7 @@ if __name__ == '__main__':
     t = 1.0
     # 其他数据
     k = np.array([2*R, 0.0, 0.0]) # 初始动量
-    R0 = np.array([-R, 0.0, 0.0]) # 起始坐标
+    R0 = np.array([R, 0.0, 0.0]) # 起始坐标
     delta = np.array(1.0) # 波包宽度参数
     m = np.array(1.0) # 质量
     lb = np.array([0.0, 0.0, 0.0, 0.0])       # r>=0, theta>=0, phi>=0, t>=0
@@ -475,6 +475,7 @@ if __name__ == '__main__':
     ub0 = np.array([R, np.pi, 2 * np.pi, 0])
     N0 = 10000
     X0 = lb + (ub0 - lb) * lhs(4, N0)
+    U0_ana, V0_ana = analytic_solution_polar(k, R0, X0)
     # 定义其他时刻 100 个数组归一化数据
     ub1 = np.array([R, np.pi, 2 * np.pi, 0.5])
     N1 = 1000
@@ -488,23 +489,23 @@ if __name__ == '__main__':
         X[:, 3] = t_values[i]
         arrays.append(X)
     # 定义解析解引导数据
-    ub2 = np.array([R, np.pi, 2 * np.pi, t])
-    N2 = 30000
-    X2 = lb + (ub2 - lb) * lhs(4, N2)
-    U2, V2 = analytic_solution_polar(k, R0, X2)
-    ana_mean_density = calculate_norm(U2, V2)
+    # ub2 = np.array([R, np.pi, 2 * np.pi, t])
+    # N2 = 30000
+    # X2 = lb + (ub2 - lb) * lhs(4, N2)
+    U2, V2 = analytic_solution_polar(k, R0, X_f)
+    ana_mean_density = calculate_norm(U0_ana, V0_ana)
     # 初始条件
     U0, V0 = initial_wave_spherical(k, R0, X0, delta)
     mean_density = calculate_norm(U0, V0)
-    print("ana_mean_density - mean_density =", ana_mean_density - mean_density)
+    print("ana_mean_density - mean_density =", ana_mean_density - mean_density) # 同一时刻下计算归一化值
 
 
     # 网络配置
-    layers = [4, 128, 128, 128, 2]
+    layers = [4, 128, 128, 2]
     model = PINN3DSpherical(layers)
-    solver = Solver3DSpherical(model, X0, U0, V0, X_f, arrays, mean_density, X2, U2, V2)
+    solver = Solver3DSpherical(model, X0, U0, V0, X_f, arrays, mean_density, X_f, U2, V2)
     # 训练
-    history = solver.train(epochs=200, lr=1e-2, initial_batch_size=30000)
+    history = solver.train(epochs=2000, lr=1e-2, initial_batch_size=10000)
     # 可视化损失
     plot_history(history)
 
