@@ -364,7 +364,7 @@ def predict_and_plot(solver, R, k, R0):
     phi = np.pi/6
     theta = 0
     t = 0.5
-    r = np.linspace(-R, R, N)
+    r = np.linspace(0, R, N)
     phi_test = np.full((1, N), phi)
     theta_test = np.full((1, N), theta)
     t_test = np.full((1, N), t)
@@ -401,7 +401,7 @@ def calculate_and_plot_diffs(solver, R, k, R0):
     N = 100
     phi = np.pi/6
     theta = 0
-    r = np.linspace(-R, R, N)
+    r = np.linspace(0, R, N)
     phi_test = np.full((1, N), phi)
     theta_test = np.full((1, N), theta)
 
@@ -462,8 +462,8 @@ if __name__ == '__main__':
     R = 1.0
     t = 1.0
     # 其他数据
-    k = np.array([2*R, 0.0, 0.0]) # 初始动量
-    R0 = np.array([R, 0.0, 0.0]) # 起始坐标
+    k = np.array([4*R, np.pi, 0.0]) # 初始动量（传播方向与起始矢量相反）
+    R0 = np.array([R, 0.0, 0.0]) # 起始坐标（起始位置放置中心0）
     delta = np.array(1.0) # 波包宽度参数
     m = np.array(1.0) # 质量
     lb = np.array([0.0, 0.0, 0.0, 0.0])       # r>=0, theta>=0, phi>=0, t>=0
@@ -505,7 +505,7 @@ if __name__ == '__main__':
     model = PINN3DSpherical(layers)
     solver = Solver3DSpherical(model, X0, U0, V0, X_f, arrays, mean_density, X_f, U2, V2)
     # 训练
-    history = solver.train(epochs=2000, lr=1e-2, initial_batch_size=10000)
+    history = solver.train(epochs=200, lr=1e-2, initial_batch_size=10000)
     # 可视化损失
     plot_history(history)
 
