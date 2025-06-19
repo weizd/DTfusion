@@ -111,15 +111,15 @@ class Solver3DSpherical:
         )
         # 实/虚部残差： iψ_t + ½Δψ = 0
         res_r = psi_i_t - 0.5 * lap_r
-        # res_r_num = res_r.cpu().detach().numpy()
+        res_r_num = res_r.cpu().detach().numpy()
         res_i = -psi_r_t - 0.5 * lap_i
 
-        threshold = 1e2
+        threshold = 1e3
         # 对res_r中大于threshold的值设为0
-        res_r = torch.where(torch.abs(res_r) > threshold, torch.tensor(0.0, device=res_r.device), res_r)
+        res_r = torch.where(torch.abs(res_r) > threshold, torch.tensor(1e3, device=res_r.device), res_r)
         # res_r_num = res_r.detach().numpy()
         # 对res_i中大于threshold的值设为0
-        res_i = torch.where(torch.abs(res_i) > threshold, torch.tensor(0.0, device=res_i.device), res_i)
+        res_i = torch.where(torch.abs(res_i) > threshold, torch.tensor(1e3, device=res_i.device), res_i)
 
         return res_r, res_i
 
@@ -147,7 +147,7 @@ class Solver3DSpherical:
         # 残差
         res_r, res_i = self.schrodinger_residual(batch_data)
         mse_pde = torch.mean(res_r**2) + torch.mean(res_i**2)
-        lr_ic = 1e3
+        lr_ic = 1e4
         lr_pde = 1.0
         lr_norm = 1e-10
         lr_ana = 1e-10
@@ -383,9 +383,9 @@ def predict_and_plot(solver, R, k, R0):
     psi_pinn_imag = psi_pinn_imag.cpu().detach().numpy()
     # 绘图对比
     plt.figure(figsize=(8, 4))
-    plt.plot(r, psi_exact_real, '--', label='Analytic Real', color='red', linewidth=2)
+    plt.plot(r, -psi_exact_real, '--', label='Analytic Real', color='red', linewidth=2)
     plt.plot(r, psi_pinn_real, '-', label='PINN Real', color='red', linewidth=2)
-    plt.plot(r, psi_exact_imag, '--', label='Analytic Imag', color='black', linewidth=2)
+    plt.plot(r, -psi_exact_imag, '--', label='Analytic Imag', color='black', linewidth=2)
     plt.plot(r, psi_pinn_imag, '-', label='PINN Imag', color='black', linewidth=2)
     plt.xlabel('r')
     plt.ylabel(r'$\psi$')
@@ -457,6 +457,20 @@ def calculate_and_plot_diffs(solver, R, k, R0):
 
     plt.show()
 
+
+def cartesian_to_spherical(X_f):
+    x = X_f[:, 0]
+    y = X_f[:, 1]
+    z = X_f[:, 2]
+    r = np.sqrt(x**2 + y**2 + z**2)
+    theta = np.arccos(z / r)                  # 极角 θ ∈ [0, π]
+    phi = np.arctan2(y, x)                    # 方位角 φ ∈ [−π, π]
+    phi = (phi + 2 * np.pi) % (2 * np.pi)     # 转为 [0, 2π)
+    t = X_f[:, 3]
+    return np.stack((r, theta, phi, t), axis=1)
+
+
+
 # 主函数示例
 if __name__ == '__main__':
     R = 1.0
@@ -466,18 +480,20 @@ if __name__ == '__main__':
     R0 = np.array([R, 0.0, 0.0]) # 起始坐标（起始位置放置中心0）
     delta = np.array(1.0) # 波包宽度参数
     m = np.array(1.0) # 质量
-    lb = np.array([0.0, 0.0, 0.0, 0.0])       # r>=0, theta>=0, phi>=0, t>=0
+    lb = np.array([-1.0, -1.0, -1.0, 0.0])       # r>=0, theta>=0, phi>=0, t>=0
     # 定义所有训练点数据
-    ub = np.array([R, np.pi, 2*np.pi, t])
+    ub = np.array([1, 1, 1, t])
     Nf = 30000
-    X_f = lb + (ub - lb) * lhs(4, Nf)
+    X_f = lb + (ub - lb) * lhs(4, Nf)  #直角坐标系下取点转换为极坐标系（）
+    X_f = cartesian_to_spherical(X_f)
     # 定义初始时刻数据
-    ub0 = np.array([R, np.pi, 2 * np.pi, 0])
+    ub0 = np.array([1, 1, 1, 0])
     N0 = 10000
     X0 = lb + (ub0 - lb) * lhs(4, N0)
+    X0 = cartesian_to_spherical(X0)
     U0_ana, V0_ana = analytic_solution_polar(k, R0, X0)
     # 定义其他时刻 100 个数组归一化数据
-    ub1 = np.array([R, np.pi, 2 * np.pi, 0.5])
+    ub1 = np.array([1, 1, 1, 0.5])
     N1 = 1000
     t_values = np.linspace(0, 1, 100)
     arrays = []
@@ -485,6 +501,7 @@ if __name__ == '__main__':
         # 拉丁超立方采样生成初始数据
         sample = lhs(4, samples=1000)  # 4 维，1000 个样本点
         X = lb + (ub1 - lb) * sample  # 将采样点映射到指定的边界范围内
+        X = cartesian_to_spherical(X)
         # 将当前数组的第四列设置为均匀分布的值
         X[:, 3] = t_values[i]
         arrays.append(X)
