@@ -37,6 +37,7 @@ class PINN3DSpherical(nn.Module):
         v = out[:, 1:2]
         return u, v
 
+
 # 求解器
 class Solver3DSpherical:
     def __init__(self, model, X0, U0, V0, X_f, arrays, mean_density, X2, U2, V2):
@@ -524,10 +525,23 @@ if __name__ == '__main__':
     layers = [4, 128, 128, 2]
     model = PINN3DSpherical(layers)
     solver = Solver3DSpherical(model, X0, U0, V0, X_f, arrays, mean_density, X_f, U2, V2)
-    # 训练
-    history = solver.train(epochs=2000, lr=1e-3, initial_batch_size=3000)
-    # 可视化损失
-    plot_history(history)
+
+    # 训练、验证网络
+    folder_path = os.getcwd()   # 获取当前程序路径
+    file_name = 'save_model.pkl'    # 保存的训练模型名称
+    file_path = folder_path + '/save_model/' + file_name
+
+    if os.path.exists(file_path) and os.path.isfile(file_path):
+        # 已经训练完成 直接加载模型
+        # model.load_state_dict(torch.load(file_path))
+    # else:
+        # 未训练模型 进行模型训练
+        history = solver.train(epochs=2, lr=1e-3, initial_batch_size=3000)
+        # 可视化损失
+        plot_history(history)
+        # 保存模型
+        torch.save(model.state_dict(), file_path)
+
 
     # 测试点 只看 φ=pi/6; θ=0; t=0.5截面
     predict_and_plot(solver, R, k, R0)
