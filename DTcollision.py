@@ -114,12 +114,15 @@ class Solver3DSpherical:
         # res_r_num = res_r.cpu().detach().numpy()
         res_i = -psi_r_t - 0.5 * lap_i
 
+        # 将张量的每个元素限制在一个指定的范围内
         threshold = 1e5
+        res_r = torch.clamp(res_r, -threshold, threshold)
+
         # 对res_r中大于threshold的值设为0
-        res_r = torch.where(torch.abs(res_r) > threshold, torch.tensor(1e5, device=res_r.device), res_r)
+        # res_r = torch.where(torch.abs(res_r) > threshold, torch.tensor(1e5, device=res_r.device), res_r)
         # res_r_num = res_r.detach().numpy()
         # 对res_i中大于threshold的值设为0
-        res_i = torch.where(torch.abs(res_i) > threshold, torch.tensor(1e5, device=res_i.device), res_i)
+        # res_i = torch.where(torch.abs(res_i) > threshold, torch.tensor(1e5, device=res_i.device), res_i)
 
         return res_r, res_i
 
