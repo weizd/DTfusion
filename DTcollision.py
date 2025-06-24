@@ -80,12 +80,12 @@ class Solver3DSpherical:
         psi_r_r, psi_r_th, psi_r_p, psi_r_t, psi_i_r, psi_i_th, psi_i_p, psi_i_t = grads
         # 二阶导数
         psi_r_rr = torch.autograd.grad(psi_r_r, rf, grad_outputs=torch.ones_like(psi_r_r), create_graph=True)[0]
-        psi_r_thth = torch.autograd.grad(psi_r_r, thetaf, grad_outputs=torch.ones_like(psi_r_r), create_graph=True)[0]
-        psi_r_pp = torch.autograd.grad(psi_r_r, phif, grad_outputs=torch.ones_like(psi_r_r), create_graph=True)[0]
+        psi_r_thth = torch.autograd.grad(psi_r_th, thetaf, grad_outputs=torch.ones_like(psi_r_r), create_graph=True)[0]
+        psi_r_pp = torch.autograd.grad(psi_r_p, phif, grad_outputs=torch.ones_like(psi_r_r), create_graph=True)[0]
 
         psi_i_rr = torch.autograd.grad(psi_i_r, rf, grad_outputs=torch.ones_like(psi_i_r), create_graph=True)[0]
-        psi_i_thth = torch.autograd.grad(psi_i_r, thetaf, grad_outputs=torch.ones_like(psi_i_r), create_graph=True)[0]
-        psi_i_pp = torch.autograd.grad(psi_i_r, phif, grad_outputs=torch.ones_like(psi_i_r), create_graph=True)[0]
+        psi_i_thth = torch.autograd.grad(psi_i_th, thetaf, grad_outputs=torch.ones_like(psi_i_r), create_graph=True)[0]
+        psi_i_pp = torch.autograd.grad(psi_i_p, phif, grad_outputs=torch.ones_like(psi_i_r), create_graph=True)[0]
 
         # 坐标分量
         r = rf
@@ -111,15 +111,15 @@ class Solver3DSpherical:
         )
         # 实/虚部残差： iψ_t + ½Δψ = 0
         res_r = psi_i_t - 0.5 * lap_r
-        res_r_num = res_r.cpu().detach().numpy()
+        # res_r_num = res_r.cpu().detach().numpy()
         res_i = -psi_r_t - 0.5 * lap_i
 
-        threshold = 1e3
+        threshold = 1e5
         # 对res_r中大于threshold的值设为0
-        res_r = torch.where(torch.abs(res_r) > threshold, torch.tensor(1e3, device=res_r.device), res_r)
+        res_r = torch.where(torch.abs(res_r) > threshold, torch.tensor(1e5, device=res_r.device), res_r)
         # res_r_num = res_r.detach().numpy()
         # 对res_i中大于threshold的值设为0
-        res_i = torch.where(torch.abs(res_i) > threshold, torch.tensor(1e3, device=res_i.device), res_i)
+        res_i = torch.where(torch.abs(res_i) > threshold, torch.tensor(1e5, device=res_i.device), res_i)
 
         return res_r, res_i
 
@@ -147,7 +147,7 @@ class Solver3DSpherical:
         # 残差
         res_r, res_i = self.schrodinger_residual(batch_data)
         mse_pde = torch.mean(res_r**2) + torch.mean(res_i**2)
-        lr_ic = 1e4
+        lr_ic = 30
         lr_pde = 1.0
         lr_norm = 1e-10
         lr_ana = 1e-10
@@ -160,7 +160,7 @@ class Solver3DSpherical:
 
     def train(self, epochs, lr, initial_batch_size):
         optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
-        scheduler = ReduceLROnPlateau(optimizer, factor=0.5, patience=100, verbose=True)
+        scheduler = ReduceLROnPlateau(optimizer, factor=0.5, patience=100, verbose=False)
         history = {'loss': [], 'ic': [], 'pde': [], 'norm': [], 'ana': []}
         start = time()
 
@@ -170,8 +170,8 @@ class Solver3DSpherical:
         # 定义 batch_size 的调整计划
         batch_size_schedule = {
             0: initial_batch_size,  # 起始 batch_size
-            500: initial_batch_size // 2,  # batch_size 减半
-            1000: initial_batch_size // 4,  # batch_size 再减半
+            50000: initial_batch_size // 2,  # batch_size 减半
+            100000: initial_batch_size // 4,  # batch_size 再减半
         }
 
         for ep in range(1, epochs + 1):
@@ -383,7 +383,7 @@ def predict_and_plot(solver, R, k, R0):
     psi_pinn_imag = psi_pinn_imag.cpu().detach().numpy()
     # 绘图对比
     plt.figure(figsize=(8, 4))
-    plt.plot(r, -psi_exact_real, '--', label='Analytic Real', color='red', linewidth=2)
+    plt.plot(r, -psi_exact_real, '--', label='Analytic Real', color='red', linewidth=2) # 注意负号
     plt.plot(r, psi_pinn_real, '-', label='PINN Real', color='red', linewidth=2)
     plt.plot(r, -psi_exact_imag, '--', label='Analytic Imag', color='black', linewidth=2)
     plt.plot(r, psi_pinn_imag, '-', label='PINN Imag', color='black', linewidth=2)
@@ -522,7 +522,7 @@ if __name__ == '__main__':
     model = PINN3DSpherical(layers)
     solver = Solver3DSpherical(model, X0, U0, V0, X_f, arrays, mean_density, X_f, U2, V2)
     # 训练
-    history = solver.train(epochs=200, lr=1e-2, initial_batch_size=10000)
+    history = solver.train(epochs=2000, lr=1e-3, initial_batch_size=3000)
     # 可视化损失
     plot_history(history)
 
