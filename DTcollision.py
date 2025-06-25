@@ -151,10 +151,10 @@ class Solver3DSpherical:
         # 残差
         res_r, res_i = self.schrodinger_residual(batch_data)
         mse_pde = torch.mean(res_r**2) + torch.mean(res_i**2)
-        lr_ic = 30
-        lr_pde = 1.0
+        lr_ic = 1e-10
+        lr_pde = 1e-10
         lr_norm = 1e-10
-        lr_ana = 1e-10
+        lr_ana = 1.0
         mse_ic = mse_ic * lr_ic
         mse_pde = mse_pde * lr_pde
         mse_norm_total = mse_norm_total * lr_norm
@@ -162,8 +162,7 @@ class Solver3DSpherical:
         loss = mse_ic + mse_pde + mse_norm_total + mse_ana
         return loss, mse_ic, mse_pde, mse_norm_total, mse_ana
 
-    def train(self, epochs, lr, initial_batch_size):
-        optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
+    def train(self, epochs, initial_batch_size, optimizer):
         scheduler = ReduceLROnPlateau(optimizer, factor=0.5, patience=100, verbose=False)
         history = {'loss': [], 'ic': [], 'pde': [], 'norm': [], 'ana': []}
         start = time()
@@ -510,9 +509,10 @@ if __name__ == '__main__':
         X[:, 3] = t_values[i]
         arrays.append(X)
     # 定义解析解引导数据
-    # ub2 = np.array([R, np.pi, 2 * np.pi, t])
-    # N2 = 30000
-    # X2 = lb + (ub2 - lb) * lhs(4, N2)
+    ub2 = np.array([1, 1, 1, t])
+    N2 = 30000
+    X2 = lb + (ub2 - lb) * lhs(4, N2)
+    X2 = cartesian_to_spherical(X2)
     U2, V2 = analytic_solution_polar(k, R0, X_f)
     ana_mean_density = calculate_norm(U0_ana, V0_ana)
     # 初始条件
@@ -522,25 +522,38 @@ if __name__ == '__main__':
 
 
     # 网络配置
+    lr = 1e-2
+    epochs = 50
     layers = [4, 128, 128, 2]
     model = PINN3DSpherical(layers)
     solver = Solver3DSpherical(model, X0, U0, V0, X_f, arrays, mean_density, X_f, U2, V2)
-
-    # 未训练模型 进行模型训练
-    history = solver.train(epochs=2, lr=1e-3, initial_batch_size=3000)
-    # 可视化损失
-    plot_history(history)
-
-    # 确保目录存在
-    file_path = os.path.join("E:/weizd/gitProject/DTfusion/save_model", "save_model.pkl")
-    os.makedirs(os.path.dirname(file_path), exist_ok=True)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     # 保存模型
-    torch.save(model.state_dict(), file_path)
-    print(f"Save model weights to {file_path}")
-    # if os.path.exists(file_path) and os.path.isfile(file_path):
+    file_path = r'./save_model/save_model.pkl'
+
+    if os.path.exists(file_path):
     #     # 已经训练完成 直接加载模型
-    #     model.load_state_dict(torch.load(file_path))
+    #     checkpoint = torch.load(file_path)
+    #     model.load_state_dict(checkpoint['model_state_dict'])
+    #     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    #     mean_density = checkpoint['mean_density']
     #     print(f"Loaded model weights from {file_path}")
+    #     # 加载已训练模型 进行模型训练
+    #     history = solver.train(epochs=10, initial_batch_size=3000, optimizer=optimizer)
+    #     # 可视化损失
+    #     plot_history(history)
+    # else:
+        # 未训练模型 进行模型训练
+        history = solver.train(epochs=epochs, initial_batch_size=3000, optimizer=optimizer)
+        # 可视化损失
+        plot_history(history)
+        # 保存模型
+        torch.save({
+            'epoch': epochs,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'mean_density': mean_density
+        }, file_path)
 
     # 测试点 只看 φ=pi/6; θ=0; t=0.5截面
     predict_and_plot(solver, R, k, R0)
