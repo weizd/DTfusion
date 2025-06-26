@@ -12,6 +12,7 @@ from pyDOE import lhs
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print("device:", device)
 
+
 # PINN 网络结构
 class PINN3DSpherical(nn.Module):
     def __init__(self, layers):
@@ -37,10 +38,47 @@ class PINN3DSpherical(nn.Module):
         v = out[:, 1:2]
         return u, v
 
-
+def cartesian_to_spherical(X_f):
+    x = X_f[:, 0]
+    y = X_f[:, 1]
+    z = X_f[:, 2]
+    r = np.sqrt(x**2 + y**2 + z**2)
+    theta = np.arccos(z / r)                  # 极角 θ ∈ [0, π]
+    phi = np.arctan2(y, x)                    # 方位角 φ ∈ [−π, π]
+    phi = (phi + 2 * np.pi) % (2 * np.pi)     # 转为 φ ∈ [0, 2π)
+    t = X_f[:, 3]
+    return np.stack((r, theta, phi, t), axis=1)
 # 求解器
 class Solver3DSpherical:
-    def __init__(self, model, X0, U0, V0, X_f, arrays, mean_density, X2, U2, V2):
+    def __init__(self, model, X0, U0, V0, X_f, arrays, mean_density, X2, U2, V2,
+                 t, n_times, n_fft, lr_ic, lr_pde, lr_norm, lr_ana, lr_fft):
+
+        self.lr_ic = lr_ic
+        self.lr_pde = lr_pde
+        self.lr_norm = lr_norm
+        self.lr_ana = lr_ana
+        self.lr_fft = lr_fft
+        self.n_fft = n_fft
+        # n 个均匀时刻
+        self.time_points = torch.linspace(0, t,
+                                          n_times, device=device)
+        # ------- ② 构建一次性空间网格 (n_fft³) -------
+        R_max = 1.0                          # 训练域半径
+        x_lin = torch.linspace(-R_max, R_max, n_fft, device=device)
+        y_lin = torch.linspace(-R_max, R_max, n_fft, device=device)
+        z_lin = torch.linspace(-R_max, R_max, n_fft, device=device)
+        xx, yy, zz = torch.meshgrid(x_lin, y_lin, z_lin, indexing='ij')
+        rr    = torch.sqrt(xx**2 + yy**2 + zz**2) + 1e-8
+        theta = torch.acos(torch.clamp(zz / rr, -1.0, 1.0))
+        phi   = torch.atan2(yy, xx)
+        phi = (phi + 2 * torch.pi) % (2 * torch.pi)  # 转为 φ ∈ [0, 2π)
+
+        # 展平成 (N_spatial,1)
+        self.r_flat = rr.reshape(-1, 1).float()
+        self.theta_flat = theta.reshape(-1, 1).float()
+        self.phi_flat = phi.reshape(-1, 1).float()
+
+        # 模型
         self.model = model.to(device)
         # 初始时刻归一化数值
         self.mean_density = mean_density
@@ -119,12 +157,6 @@ class Solver3DSpherical:
         threshold = 1e5
         res_r = torch.clamp(res_r, -threshold, threshold)
 
-        # 对res_r中大于threshold的值设为0
-        # res_r = torch.where(torch.abs(res_r) > threshold, torch.tensor(1e5, device=res_r.device), res_r)
-        # res_r_num = res_r.detach().numpy()
-        # 对res_i中大于threshold的值设为0
-        # res_i = torch.where(torch.abs(res_i) > threshold, torch.tensor(1e5, device=res_i.device), res_i)
-
         return res_r, res_i
 
     def loss(self, batch_data):
@@ -151,20 +183,44 @@ class Solver3DSpherical:
         # 残差
         res_r, res_i = self.schrodinger_residual(batch_data)
         mse_pde = torch.mean(res_r**2) + torch.mean(res_i**2)
-        lr_ic = 1e-10
-        lr_pde = 1e-10
-        lr_norm = 1e-10
-        lr_ana = 1.0
-        mse_ic = mse_ic * lr_ic
-        mse_pde = mse_pde * lr_pde
-        mse_norm_total = mse_norm_total * lr_norm
-        mse_ana = mse_ana * lr_ana
-        loss = mse_ic + mse_pde + mse_norm_total + mse_ana
-        return loss, mse_ic, mse_pde, mse_norm_total, mse_ana
+        # ★ 新增：n 个时刻的常数项模损失
+        mse_fft = 0.0
+        N_spatial = self.r_flat.shape[0]
+
+        for t_val in self.time_points:  # t₁…tₙ
+            t_flat = t_val.repeat(N_spatial, 1)  # (N_spatial,1)
+
+            psi_r, psi_i = self.model(self.r_flat,
+                                      self.theta_flat,
+                                      self.phi_flat,
+                                      t_flat)
+
+            psi_complex = (psi_r.squeeze(-1) + 1j * psi_i.squeeze(-1)) \
+                .reshape(self.n_fft, self.n_fft, self.n_fft)
+
+            fft_vals = torch.fft.fftn(psi_complex,
+                                      dim=(0, 1, 2),
+                                      norm='forward')
+            const_mod = torch.abs(fft_vals[0, 0, 0])  # |F₀|(t)
+
+            # ▼ 若需逼近解析常数项 C(t)，用下面一行替换
+            #   const_mod_target = self.const_target[idx]
+            #   mse_fft += (const_mod - const_mod_target).pow(2)
+            mse_fft += const_mod.pow(2)  # 目标 → 0(需要平均一下)
+            count = len(self.time_points)
+            mse_fft = mse_fft/count
+
+        mse_ic = mse_ic * self.lr_ic
+        mse_pde = mse_pde * self.lr_pde
+        mse_norm_total = mse_norm_total * self.lr_norm
+        mse_ana = mse_ana * self.lr_ana
+        mse_fft = mse_fft * self.lr_fft
+        loss = mse_ic + mse_pde + mse_norm_total + mse_ana + mse_fft
+        return loss, mse_ic, mse_pde, mse_norm_total, mse_ana, mse_fft
 
     def train(self, epochs, initial_batch_size, optimizer):
         scheduler = ReduceLROnPlateau(optimizer, factor=0.5, patience=100, verbose=False)
-        history = {'loss': [], 'ic': [], 'pde': [], 'norm': [], 'ana': []}
+        history = {'loss': [], 'ic': [], 'pde': [], 'norm': [], 'ana': [], 'fft': []}
         start = time()
 
         # self.data 包含训练所需的所有数据
@@ -203,14 +259,14 @@ class Solver3DSpherical:
                 optimizer.zero_grad()
 
                 # 计算当前批次的损失
-                loss, ic, pde, norm, ana = self.loss(batch_data)
+                loss, ic, pde, norm, ana, fft = self.loss(batch_data)
 
                 loss.backward()
                 optimizer.step()
 
             # 使用整个数据集的损失来更新学习率调度器
             # 计算整个数据集的损失
-            total_loss, total_ic, total_pde, total_norm, total_ana = self.loss(data)
+            total_loss, total_ic, total_pde, total_norm, total_ana, total_fft = self.loss(data)
             scheduler.step(total_loss)
 
             # 记录历史信息
@@ -219,11 +275,12 @@ class Solver3DSpherical:
             history['pde'].append(total_pde.item())
             history['norm'].append(total_norm.item())
             history['ana'].append(total_ana.item())
+            history['fft'].append(total_fft.item())
 
             if ep % 1 == 0:
                 print(
                     f"Epoch {ep}/{epochs}, Batch Size: {current_batch_size}, Loss: {total_loss.item():.4e}, IC: {total_ic.item():.4e},"
-                    f" PDE: {total_pde.item():.4e}, norm: {total_norm.item():.4e}, ana: {total_ana.item():.4e}")
+                    f" PDE: {total_pde.item():.4e}, norm: {total_norm.item():.4e}, ana: {total_ana.item():.4e}, fft: {total_fft.item():.4e}")
 
         print(f"Training completed in {time() - start:.1f}s")
         return history
@@ -343,8 +400,8 @@ def plot_history(history, save_path=None):
     colors = ['blue', 'green', 'red', 'purple', 'black']
     line_styles = ['-', '--', '-.', ':', '-.']
     # 绘制每种损失曲线
-    loss_labels = ['Total Loss', 'IC Loss', 'PDE Loss', 'Norm Loss', 'Ana Loss']
-    for i, (key, label) in enumerate(zip(['loss', 'ic', 'pde', 'norm', 'ana'], loss_labels)):
+    loss_labels = ['Total Loss', 'IC Loss', 'PDE Loss', 'FFT Loss', 'Ana Loss']
+    for i, (key, label) in enumerate(zip(['loss', 'ic', 'pde', 'fft', 'ana'], loss_labels)):
         # 确保历史记录中有这个键
         if key in history:
             plt.semilogy(history[key], label=label, color=colors[i % len(colors)], linestyle=line_styles[i % len(line_styles)], linewidth=2)
@@ -386,9 +443,9 @@ def predict_and_plot(solver, R, k, R0):
     psi_pinn_imag = psi_pinn_imag.cpu().detach().numpy()
     # 绘图对比
     plt.figure(figsize=(8, 4))
-    plt.plot(r, -psi_exact_real, '--', label='Analytic Real', color='red', linewidth=2) # 注意负号
+    plt.plot(r, psi_exact_real, '--', label='Analytic Real', color='red', linewidth=2) # 注意负号
     plt.plot(r, psi_pinn_real, '-', label='PINN Real', color='red', linewidth=2)
-    plt.plot(r, -psi_exact_imag, '--', label='Analytic Imag', color='black', linewidth=2)
+    plt.plot(r, psi_exact_imag, '--', label='Analytic Imag', color='black', linewidth=2)
     plt.plot(r, psi_pinn_imag, '-', label='PINN Imag', color='black', linewidth=2)
     plt.xlabel('r')
     plt.ylabel(r'$\psi$')
@@ -468,7 +525,7 @@ def cartesian_to_spherical(X_f):
     r = np.sqrt(x**2 + y**2 + z**2)
     theta = np.arccos(z / r)                  # 极角 θ ∈ [0, π]
     phi = np.arctan2(y, x)                    # 方位角 φ ∈ [−π, π]
-    phi = (phi + 2 * np.pi) % (2 * np.pi)     # 转为 [0, 2π)
+    phi = (phi + 2 * np.pi) % (2 * np.pi)     # 转为 φ ∈ [0, 2π)
     t = X_f[:, 3]
     return np.stack((r, theta, phi, t), axis=1)
 
@@ -483,11 +540,11 @@ if __name__ == '__main__':
     R0 = np.array([R, 0.0, 0.0]) # 起始坐标（起始位置放置中心0）
     delta = np.array(1.0) # 波包宽度参数
     m = np.array(1.0) # 质量
-    lb = np.array([-1.0, -1.0, -1.0, 0.0])       # r>=0, theta>=0, phi>=0, t>=0
+    lb = np.array([-1.0, -1.0, -1.0, 0.0])
     # 定义所有训练点数据
     ub = np.array([1, 1, 1, t])
     Nf = 30000
-    X_f = lb + (ub - lb) * lhs(4, Nf)  #直角坐标系下取点转换为极坐标系（）
+    X_f = lb + (ub - lb) * lhs(4, Nf)  #直角坐标系下取点转换为极坐标系
     X_f = cartesian_to_spherical(X_f)
     # 定义初始时刻数据
     ub0 = np.array([1, 1, 1, 0])
@@ -509,10 +566,10 @@ if __name__ == '__main__':
         X[:, 3] = t_values[i]
         arrays.append(X)
     # 定义解析解引导数据
-    ub2 = np.array([1, 1, 1, t])
-    N2 = 30000
-    X2 = lb + (ub2 - lb) * lhs(4, N2)
-    X2 = cartesian_to_spherical(X2)
+    # ub2 = np.array([1, 1, 1, t])
+    # N2 = 30000
+    # X2 = lb + (ub2 - lb) * lhs(4, N2)
+    # X2 = cartesian_to_spherical(X2)
     U2, V2 = analytic_solution_polar(k, R0, X_f)
     ana_mean_density = calculate_norm(U0_ana, V0_ana)
     # 初始条件
@@ -520,29 +577,39 @@ if __name__ == '__main__':
     mean_density = calculate_norm(U0, V0)
     print("ana_mean_density - mean_density =", ana_mean_density - mean_density) # 同一时刻下计算归一化值
 
+    # 损失函数权重
+    lr_ic = 1.0
+    lr_pde = 1.0
+    lr_norm = 1e-10
+    lr_ana = 1e-10
+    lr_fft = 1.0  # <<< 常数项损失权重
 
+    n_times = 10  # <<< 新增：时刻个数
+    n_fft = 16  # <<< 新增：FFT 网格边长
+    # 学习率
+    lr = 1e-3
+    epochs = 500
     # 网络配置
-    lr = 1e-2
-    epochs = 50
     layers = [4, 128, 128, 2]
     model = PINN3DSpherical(layers)
-    solver = Solver3DSpherical(model, X0, U0, V0, X_f, arrays, mean_density, X_f, U2, V2)
+    solver = Solver3DSpherical(model, X0, U0, V0, X_f, arrays, mean_density, X_f, U2, V2,
+                               t, n_times, n_fft, lr_ic, lr_pde, lr_norm, lr_ana, lr_fft)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     # 保存模型
     file_path = r'./save_model/save_model.pkl'
 
     if os.path.exists(file_path):
-    #     # 已经训练完成 直接加载模型
-    #     checkpoint = torch.load(file_path)
-    #     model.load_state_dict(checkpoint['model_state_dict'])
-    #     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    #     mean_density = checkpoint['mean_density']
-    #     print(f"Loaded model weights from {file_path}")
-    #     # 加载已训练模型 进行模型训练
-    #     history = solver.train(epochs=10, initial_batch_size=3000, optimizer=optimizer)
-    #     # 可视化损失
-    #     plot_history(history)
-    # else:
+        # 已经训练完成 直接加载模型
+        checkpoint = torch.load(file_path)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        mean_density = checkpoint['mean_density']
+        print(f"Loaded model weights from {file_path}")
+        # 加载已训练模型 进行模型训练
+        history = solver.train(epochs=100, initial_batch_size=3000, optimizer=optimizer)
+        # 可视化损失
+        plot_history(history)
+    else:
         # 未训练模型 进行模型训练
         history = solver.train(epochs=epochs, initial_batch_size=3000, optimizer=optimizer)
         # 可视化损失
