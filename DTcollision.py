@@ -38,26 +38,18 @@ class PINN3DSpherical(nn.Module):
         v = out[:, 1:2]
         return u, v
 
-def cartesian_to_spherical(X_f):
-    x = X_f[:, 0]
-    y = X_f[:, 1]
-    z = X_f[:, 2]
-    r = np.sqrt(x**2 + y**2 + z**2)
-    theta = np.arccos(z / r)                  # 极角 θ ∈ [0, π]
-    phi = np.arctan2(y, x)                    # 方位角 φ ∈ [−π, π]
-    phi = (phi + 2 * np.pi) % (2 * np.pi)     # 转为 φ ∈ [0, 2π)
-    t = X_f[:, 3]
-    return np.stack((r, theta, phi, t), axis=1)
 # 求解器
 class Solver3DSpherical:
     def __init__(self, model, X0, U0, V0, X_f, arrays, mean_density, X2, U2, V2,
-                 t, n_times, n_fft, lr_ic, lr_pde, lr_norm, lr_ana, lr_fft):
+                 t, n_times, n_fft, lr_ic, lr_pde, lr_norm, lr_ana, lr_fft, lr_mom, lr_ene):
 
         self.lr_ic = lr_ic
         self.lr_pde = lr_pde
         self.lr_norm = lr_norm
         self.lr_ana = lr_ana
         self.lr_fft = lr_fft
+        self.lr_mom = lr_mom
+        self.lr_ene = lr_ene
         self.n_fft = n_fft
         # n 个均匀时刻
         self.time_points = torch.linspace(0, t,
@@ -83,148 +75,185 @@ class Solver3DSpherical:
         # 初始时刻归一化数值
         self.mean_density = mean_density
         # 初始条件数据
-        self.r0 = torch.tensor(X0[:, 0:1], dtype=torch.float32, device=device)
-        self.theta0 = torch.tensor(X0[:, 1:2], dtype=torch.float32, device=device)
-        self.phi0 = torch.tensor(X0[:, 2:3], dtype=torch.float32, device=device)
-        self.t0 = torch.tensor(X0[:, 3:4], dtype=torch.float32, device=device)
-        self.u0 = U0.clone().detach().to(dtype=torch.float32, device=device)
-        self.v0 = V0.clone().detach().to(dtype=torch.float32, device=device)
+        self.u0 = U0
+        self.v0 = V0
+
         # 解析解引导数据
-        self.r2 = torch.tensor(X2[:, 0:1], dtype=torch.float32, device=device)
-        self.theta2 = torch.tensor(X2[:, 1:2], dtype=torch.float32, device=device)
-        self.phi2 = torch.tensor(X2[:, 2:3], dtype=torch.float32, device=device)
-        self.t2 = torch.tensor(X2[:, 3:4], dtype=torch.float32, device=device)
-        self.u2 = U2.clone().detach().to(dtype=torch.float32, device=device)
-        self.v2 = V2.clone().detach().to(dtype=torch.float32, device=device)
+        self.X2 = torch.tensor(X2, dtype=torch.float32, device=device, requires_grad=True)
+        self.u2 = U2
+        self.v2 = V2
         # 原始大数量数组
-        self.data = X_f
+        self.data = torch.tensor(X_f, dtype=torch.float32, device=device, requires_grad=True)
         # 其他时刻归一化数据集合
         self.arrays = arrays
+        # 初始时刻总采样点
+        self.X0 = torch.tensor(X0, dtype=torch.float32, device=device, requires_grad=True)
 
     def schrodinger_residual(self, batch_data):
-        # 残差点
-        rf = torch.tensor(batch_data[:, 0:1], dtype=torch.float32, device=device, requires_grad=True)
-        thetaf = torch.tensor(batch_data[:, 1:2], dtype=torch.float32, device=device, requires_grad=True)
-        phif = torch.tensor(batch_data[:, 2:3], dtype=torch.float32, device=device, requires_grad=True)
-        tf = torch.tensor(batch_data[:, 3:4], dtype=torch.float32, device=device, requires_grad=True)
-        psi_r, psi_i = self.model(rf, thetaf, phif, tf)
-        # 一阶导数
-        grads = torch.autograd.grad(
-            psi_r, [rf, thetaf, phif, tf],
-            grad_outputs=torch.ones_like(psi_r), create_graph=True
-        ) + torch.autograd.grad(
-            psi_i, [rf, thetaf, phif, tf],
-            grad_outputs=torch.ones_like(psi_i), create_graph=True
-        )
-        psi_r_r, psi_r_th, psi_r_p, psi_r_t, psi_i_r, psi_i_th, psi_i_p, psi_i_t = grads
-        # 二阶导数
-        psi_r_rr = torch.autograd.grad(psi_r_r, rf, grad_outputs=torch.ones_like(psi_r_r), create_graph=True)[0]
-        psi_r_thth = torch.autograd.grad(psi_r_th, thetaf, grad_outputs=torch.ones_like(psi_r_r), create_graph=True)[0]
-        psi_r_pp = torch.autograd.grad(psi_r_p, phif, grad_outputs=torch.ones_like(psi_r_r), create_graph=True)[0]
+        batch_data = batch_data.clone().detach().to(device).requires_grad_(True)
+        lap_r, lap_i, psi_i_t, psi_r_t = self.laplacian(batch_data)
 
-        psi_i_rr = torch.autograd.grad(psi_i_r, rf, grad_outputs=torch.ones_like(psi_i_r), create_graph=True)[0]
-        psi_i_thth = torch.autograd.grad(psi_i_th, thetaf, grad_outputs=torch.ones_like(psi_i_r), create_graph=True)[0]
-        psi_i_pp = torch.autograd.grad(psi_i_p, phif, grad_outputs=torch.ones_like(psi_i_r), create_graph=True)[0]
-
-        # 坐标分量
-        r = rf
-        theta = thetaf
-        sin_t = torch.sin(theta)
-        sin2_t = sin_t ** 2
-
-        # 构造 Laplacian (实/虚部共用结构)
-        lap_r = (
-                psi_r_rr
-                + 2 / r * psi_r_r
-                + (1 / (r ** 2)) * psi_r_thth
-                + (torch.cos(theta) / (r ** 2 * sin_t)) * psi_r_th
-                + (1 / (r ** 2 * sin2_t)) * psi_r_pp
-        )
-
-        lap_i = (
-                psi_i_rr
-                + 2 / r * psi_i_r
-                + (1 / (r ** 2)) * psi_i_thth
-                + (torch.cos(theta) / (r ** 2 * sin_t)) * psi_i_th
-                + (1 / (r ** 2 * sin2_t)) * psi_i_pp
-        )
         # 实/虚部残差： iψ_t + ½Δψ = 0
         res_r = psi_i_t - 0.5 * lap_r
-        # res_r_num = res_r.cpu().detach().numpy()
         res_i = -psi_r_t - 0.5 * lap_i
 
-        # 将张量的每个元素限制在一个指定的范围内
+        # 可选：限制数值发散，避免 inf/NaN
         threshold = 1e5
         res_r = torch.clamp(res_r, -threshold, threshold)
+        res_i = torch.clamp(res_i, -threshold, threshold)
 
         return res_r, res_i
 
+    def split_input_with_grad(self, data):
+        r = data[:, 0:1].clone().detach().to(device).requires_grad_(True)
+        theta = data[:, 1:2].clone().detach().to(device).requires_grad_(True)
+        phi = data[:, 2:3].clone().detach().to(device).requires_grad_(True)
+        t = data[:, 3:4].clone().detach().to(device).requires_grad_(True)
+        return r, theta, phi, t
+
+    def laplacian(self, data):
+        """输入为 (N,4): r, θ, φ, t"""
+        r, theta, phi, t = self.split_input_with_grad(data)
+
+        # ψ_r 和 ψ_i
+        psi_r, psi_i = self.model(r, theta, phi, t)
+
+        # 一阶导数
+        grad_psi_r = torch.autograd.grad(psi_r, [r, theta, phi, t],
+                                         grad_outputs=torch.ones_like(psi_r),
+                                         create_graph=True)
+        grad_psi_i = torch.autograd.grad(psi_i, [r, theta, phi, t],
+                                         grad_outputs=torch.ones_like(psi_i),
+                                         create_graph=True)
+
+        psi_r_r, psi_r_th, psi_r_p, psi_r_t = grad_psi_r
+        psi_i_r, psi_i_th, psi_i_p, psi_i_t = grad_psi_i
+
+        # 二阶导数
+        psi_r_rr = torch.autograd.grad(psi_r_r, r, grad_outputs=torch.ones_like(psi_r_r), create_graph=True)[0]
+        psi_r_thth = torch.autograd.grad(psi_r_th, theta, grad_outputs=torch.ones_like(psi_r_th), create_graph=True)[0]
+        psi_r_pp = torch.autograd.grad(psi_r_p, phi, grad_outputs=torch.ones_like(psi_r_p), create_graph=True)[0]
+
+        psi_i_rr = torch.autograd.grad(psi_i_r, r, grad_outputs=torch.ones_like(psi_i_r), create_graph=True)[0]
+        psi_i_thth = torch.autograd.grad(psi_i_th, theta, grad_outputs=torch.ones_like(psi_i_th), create_graph=True)[0]
+        psi_i_pp = torch.autograd.grad(psi_i_p, phi, grad_outputs=torch.ones_like(psi_i_p), create_graph=True)[0]
+
+        sin_theta = torch.sin(theta)
+        cos_theta = torch.cos(theta)
+        sin2_theta = sin_theta ** 2
+        r2 = r ** 2
+
+        # Laplacian 计算（球坐标形式）
+        lap_r = (
+                psi_r_rr +
+                2 / r * psi_r_r +
+                1 / r2 * psi_r_thth +
+                cos_theta / (r2 * sin_theta) * psi_r_th +
+                1 / (r2 * sin2_theta) * psi_r_pp
+        )
+
+        lap_i = (
+                psi_i_rr +
+                2 / r * psi_i_r +
+                1 / r2 * psi_i_thth +
+                cos_theta / (r2 * sin_theta) * psi_i_th +
+                1 / (r2 * sin2_theta) * psi_i_pp
+        )
+
+        return lap_r, lap_i, psi_i_t, psi_r_t
+
     def loss(self, batch_data):
-        # 其他时刻归一化数据点
+        mse_energy = []
+        mse_momentum = []
         mse_norm = []
-        for i in range (len(self.arrays)):
-            r_norm = torch.tensor(arrays[i][:, 0:1], dtype=torch.float32, device=device, requires_grad=True)
-            theta_norm = torch.tensor(arrays[i][:, 1:2], dtype=torch.float32, device=device, requires_grad=True)
-            phi_norm = torch.tensor(arrays[i][:, 2:3], dtype=torch.float32, device=device, requires_grad=True)
-            t_norm = torch.tensor(arrays[i][:, 3:4], dtype=torch.float32, device=device, requires_grad=True)
-            # 归一化损失
-            psi_r, psi_i = self.model(r_norm, theta_norm, phi_norm, t_norm)
-            density_norm = psi_r ** 2 + psi_i ** 2
-            mean_density_norm = torch.sqrt(torch.sum(density_norm))
-            current_mse_norm = (mean_density_norm - self.mean_density)**2
-            mse_norm.append(current_mse_norm)
-        mse_norm_total = torch.stack(mse_norm).sum()
+        r0, th0, ph0, t0 = self.split_input_with_grad(self.X0)
+        psi_r0, psi_i0 = self.model(r0, th0, ph0, t0)
+        # 1. 初始能量
+        lap_r0, lap_i0, _, _ = self.laplacian(self.X0)
+        energy_r0 = torch.mean(psi_r0 * lap_r0 + psi_i0 * lap_i0)
+
+        # 2. 初始动量
+        psi_r_r0, psi_r_th0, psi_r_p0, _ = torch.autograd.grad(
+            psi_r0, [r0, th0, ph0, t0],
+            grad_outputs=torch.ones_like(psi_r0), create_graph=True
+        )
+        psi_i_r0, psi_i_th0, psi_i_p0, _ = torch.autograd.grad(
+            psi_i0, [r0, th0, ph0, t0],
+            grad_outputs=torch.ones_like(psi_i0), create_graph=True
+        )
+        momentum_r0 = torch.mean(psi_r0 * (psi_i_r0 + psi_i_th0 + psi_i_p0) -
+                                 psi_i0 * (psi_r_r0 + psi_r_th0 + psi_r_p0))
+
+        # 3. 其他时刻
+        for i in range(len(self.arrays)):
+            arr = torch.tensor(self.arrays[i], dtype=torch.float32, device=device, requires_grad=True)
+            r, th, ph, t = self.split_input_with_grad(arr)
+            psi_r, psi_i = self.model(r, th, ph, t)
+            # energy
+            lap_r, lap_i, _, _ = self.laplacian(arr)
+            energy_r = torch.mean(psi_r * lap_r + psi_i * lap_i)
+            mse_energy.append((energy_r - energy_r0).pow(2))
+
+            # momentum
+            grad_r = torch.autograd.grad(psi_r, [r, th, ph, t], grad_outputs=torch.ones_like(psi_r), create_graph=True)
+            grad_i = torch.autograd.grad(psi_i, [r, th, ph, t], grad_outputs=torch.ones_like(psi_i), create_graph=True)
+            psi_r_r, psi_r_th, psi_r_p, _ = grad_r
+            psi_i_r, psi_i_th, psi_i_p, _ = grad_i
+            momentum_r = torch.mean(psi_r * (psi_i_r + psi_i_th + psi_i_p) -
+                                    psi_i * (psi_r_r + psi_r_th + psi_r_p))
+            mse_momentum.append((momentum_r - momentum_r0).pow(2))
+
+            # norm
+            density = psi_r ** 2 + psi_i ** 2
+            mean_density = torch.sqrt(torch.sum(density))
+            mse_norm.append((mean_density - self.mean_density).pow(2))
+
+        mse_energy_total = torch.stack(mse_energy).mean()
+        mse_momentum_total = torch.stack(mse_momentum).mean()
+        mse_norm_total = torch.stack(mse_norm).mean()
+
         # 初始条件损失
-        u0_pred, v0_pred = self.model(self.r0, self.theta0, self.phi0, self.t0)
-        mse_ic = torch.mean((u0_pred - self.u0)**2) + torch.mean((v0_pred - self.v0)**2)
-        # 解析解引导数据损失
-        u2_pred, v2_pred = self.model(self.r2, self.theta2, self.phi2, self.t2)
-        mse_ana = torch.mean((u2_pred - self.u2)**2) + torch.mean((v2_pred - self.v2)**2)
-        # 残差
+        u0_pred, v0_pred = self.model(r0, th0, ph0, t0)
+        mse_ic = torch.mean((u0_pred - self.u0) ** 2) + torch.mean((v0_pred - self.v0) ** 2)
+
+        # 解析引导损失
+        r2, th2, ph2, t2 = self.split_input_with_grad(self.X2)
+        u2_pred, v2_pred = self.model(r2, th2, ph2, t2)
+        mse_ana = torch.mean((u2_pred - self.u2) ** 2) + torch.mean((v2_pred - self.v2) ** 2)
+
+        # PDE 残差
         res_r, res_i = self.schrodinger_residual(batch_data)
-        mse_pde = torch.mean(res_r**2) + torch.mean(res_i**2)
-        # ★ 新增：n 个时刻的常数项模损失
+        mse_pde = torch.mean(res_r ** 2) + torch.mean(res_i ** 2)
+
+        # FFT 损失
         mse_fft = 0.0
-        N_spatial = self.r_flat.shape[0]
+        for t_val in self.time_points:
+            t_flat = t_val.repeat(self.r_flat.shape[0], 1)
+            psi_r, psi_i = self.model(self.r_flat, self.theta_flat, self.phi_flat, t_flat)
+            psi_complex = (psi_r.squeeze(-1) + 1j * psi_i.squeeze(-1)).reshape(self.n_fft, self.n_fft, self.n_fft)
+            fft_vals = torch.fft.fftn(psi_complex, dim=(0, 1, 2), norm='forward')
+            const_mod = torch.abs(fft_vals[0, 0, 0])
+            mse_fft += const_mod.pow(2)
+        mse_fft = mse_fft / len(self.time_points)
 
-        for t_val in self.time_points:  # t₁…tₙ
-            t_flat = t_val.repeat(N_spatial, 1)  # (N_spatial,1)
-
-            psi_r, psi_i = self.model(self.r_flat,
-                                      self.theta_flat,
-                                      self.phi_flat,
-                                      t_flat)
-
-            psi_complex = (psi_r.squeeze(-1) + 1j * psi_i.squeeze(-1)) \
-                .reshape(self.n_fft, self.n_fft, self.n_fft)
-
-            fft_vals = torch.fft.fftn(psi_complex,
-                                      dim=(0, 1, 2),
-                                      norm='forward')
-            const_mod = torch.abs(fft_vals[0, 0, 0])  # |F₀|(t)
-
-            # ▼ 若需逼近解析常数项 C(t)，用下面一行替换
-            #   const_mod_target = self.const_target[idx]
-            #   mse_fft += (const_mod - const_mod_target).pow(2)
-            mse_fft += const_mod.pow(2)  # 目标 → 0(需要平均一下)
-            count = len(self.time_points)
-            mse_fft = mse_fft/count
-
+        # 权重加权总损失
         mse_ic = mse_ic * self.lr_ic
         mse_pde = mse_pde * self.lr_pde
         mse_norm_total = mse_norm_total * self.lr_norm
         mse_ana = mse_ana * self.lr_ana
         mse_fft = mse_fft * self.lr_fft
-        loss = mse_ic + mse_pde + mse_norm_total + mse_ana + mse_fft
-        return loss, mse_ic, mse_pde, mse_norm_total, mse_ana, mse_fft
+        mse_momentum_total = mse_momentum_total * self.lr_mom
+        mse_energy_total = mse_energy_total * self.lr_ene
+
+        total_loss = (mse_ic + mse_pde + mse_norm_total + mse_ana +
+                      mse_fft + mse_momentum_total + mse_energy_total)
+
+        return total_loss, mse_ic, mse_pde, mse_norm_total, mse_ana, mse_fft, mse_momentum_total, mse_energy_total
 
     def train(self, epochs, initial_batch_size, optimizer):
-        scheduler = ReduceLROnPlateau(optimizer, factor=0.5, patience=100, verbose=False)
-        history = {'loss': [], 'ic': [], 'pde': [], 'norm': [], 'ana': [], 'fft': []}
+        scheduler = ReduceLROnPlateau(optimizer, factor=0.5, patience=100)
+        history = {'loss': [], 'ic': [], 'pde': [], 'norm': [], 'ana': [], 'fft': [], 'mom': [], 'ene': []}
         start = time()
-
-        # self.data 包含训练所需的所有数据
-        data = self.data  # 获取所有训练数据
 
         # 定义 batch_size 的调整计划
         batch_size_schedule = {
@@ -243,10 +272,10 @@ class Solver3DSpherical:
                 current_batch_size = initial_batch_size
 
             # 计算批次数量
-            num_batches = len(data) // current_batch_size
+            num_batches = len(self.data) // current_batch_size
 
             # 在每个 epoch 开始时重置批次索引
-            batch_indices = np.arange(len(data))
+            batch_indices = np.arange(len(self.data))
             np.random.shuffle(batch_indices)
 
             for batch_idx in range(num_batches):
@@ -255,18 +284,18 @@ class Solver3DSpherical:
                 end_idx = (batch_idx + 1) * current_batch_size
 
                 # 获取当前批次的数据
-                batch_data = data[batch_indices[start_idx:end_idx]]
+                batch_data = self.data[batch_indices[start_idx:end_idx]]
                 optimizer.zero_grad()
 
                 # 计算当前批次的损失
-                loss, ic, pde, norm, ana, fft = self.loss(batch_data)
+                loss, ic, pde, norm, ana, fft, mom, ene = self.loss(batch_data)
 
-                loss.backward()
+                loss.backward(retain_graph=True)
                 optimizer.step()
 
             # 使用整个数据集的损失来更新学习率调度器
             # 计算整个数据集的损失
-            total_loss, total_ic, total_pde, total_norm, total_ana, total_fft = self.loss(data)
+            total_loss, total_ic, total_pde, total_norm, total_ana, total_fft, total_mom, total_ene = self.loss(self.data)
             scheduler.step(total_loss)
 
             # 记录历史信息
@@ -276,12 +305,14 @@ class Solver3DSpherical:
             history['norm'].append(total_norm.item())
             history['ana'].append(total_ana.item())
             history['fft'].append(total_fft.item())
+            history['mom'].append(total_mom.item())
+            history['ene'].append(total_ene.item())
 
             if ep % 1 == 0:
                 print(
                     f"Epoch {ep}/{epochs}, Batch Size: {current_batch_size}, Loss: {total_loss.item():.4e}, IC: {total_ic.item():.4e},"
-                    f" PDE: {total_pde.item():.4e}, norm: {total_norm.item():.4e}, ana: {total_ana.item():.4e}, fft: {total_fft.item():.4e}")
-
+                    f"PDE: {total_pde.item():.4e}, norm: {total_norm.item():.4e}, ana: {total_ana.item():.4e}, fft: {total_fft.item():.4e},"
+                    f"mom: {total_mom.item():.4e}, ene: {total_ene.item():.4e}")
         print(f"Training completed in {time() - start:.1f}s")
         return history
 
@@ -397,11 +428,11 @@ def plot_history(history, save_path=None):
     # 创建一个新的图形
     plt.figure(figsize=(10, 6))  # 设置图形大小
     # 定义颜色和线条样式
-    colors = ['blue', 'green', 'red', 'purple', 'black']
-    line_styles = ['-', '--', '-.', ':', '-.']
+    colors = ['blue', 'green', 'red', 'purple', 'black', 'orange', 'yellow']
+    line_styles = ['-', '--', '-.', ':', '-.', '-.', '-.']
     # 绘制每种损失曲线
-    loss_labels = ['Total Loss', 'IC Loss', 'PDE Loss', 'FFT Loss', 'Ana Loss']
-    for i, (key, label) in enumerate(zip(['loss', 'ic', 'pde', 'fft', 'ana'], loss_labels)):
+    loss_labels = ['Total Loss', 'IC Loss', 'PDE Loss', 'FFT Loss', 'Ana Loss', 'Mom Loss', 'Ene Loss']
+    for i, (key, label) in enumerate(zip(['loss', 'ic', 'pde', 'fft', 'ana', 'mom', 'ene'], loss_labels)):
         # 确保历史记录中有这个键
         if key in history:
             plt.semilogy(history[key], label=label, color=colors[i % len(colors)], linestyle=line_styles[i % len(line_styles)], linewidth=2)
@@ -557,7 +588,7 @@ if __name__ == '__main__':
     N1 = 1000
     t_values = np.linspace(0, 1, 100)
     arrays = []
-    for i in range(100):
+    for i in range(10):
         # 拉丁超立方采样生成初始数据
         sample = lhs(4, samples=1000)  # 4 维，1000 个样本点
         X = lb + (ub1 - lb) * sample  # 将采样点映射到指定的边界范围内
@@ -578,11 +609,13 @@ if __name__ == '__main__':
     print("ana_mean_density - mean_density =", ana_mean_density - mean_density) # 同一时刻下计算归一化值
 
     # 损失函数权重
-    lr_ic = 1.0
+    lr_ic = 10
     lr_pde = 1.0
     lr_norm = 1e-10
     lr_ana = 1e-10
-    lr_fft = 1.0  # <<< 常数项损失权重
+    lr_fft = 1e-10
+    lr_mom = 1e6
+    lr_ene = 1e5
 
     n_times = 10  # <<< 新增：时刻个数
     n_fft = 16  # <<< 新增：FFT 网格边长
@@ -593,7 +626,7 @@ if __name__ == '__main__':
     layers = [4, 128, 128, 2]
     model = PINN3DSpherical(layers)
     solver = Solver3DSpherical(model, X0, U0, V0, X_f, arrays, mean_density, X_f, U2, V2,
-                               t, n_times, n_fft, lr_ic, lr_pde, lr_norm, lr_ana, lr_fft)
+                               t, n_times, n_fft, lr_ic, lr_pde, lr_norm, lr_ana, lr_fft, lr_mom, lr_ene)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     # 保存模型
     file_path = r'./save_model/save_model.pkl'
@@ -606,7 +639,7 @@ if __name__ == '__main__':
         mean_density = checkpoint['mean_density']
         print(f"Loaded model weights from {file_path}")
         # 加载已训练模型 进行模型训练
-        history = solver.train(epochs=100, initial_batch_size=3000, optimizer=optimizer)
+        history = solver.train(epochs=15000, initial_batch_size=3000, optimizer=optimizer)
         # 可视化损失
         plot_history(history)
     else:
