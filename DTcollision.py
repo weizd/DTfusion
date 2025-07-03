@@ -255,50 +255,54 @@ class Solver3DSpherical:
         history = {'loss': [], 'ic': [], 'pde': [], 'norm': [], 'ana': [], 'fft': [], 'mom': [], 'ene': []}
         start = time()
 
-        # 定义 batch_size 的调整计划
+        # ========== 实时绘图设置 ==========
+        plt.ion()  # 打开交互模式
+        fig, ax = plt.subplots(figsize=(10, 6))
+        keys = ['loss', 'ic', 'pde', 'norm', 'ana', 'fft', 'mom', 'ene']
+        labels = ['Total Loss', 'IC Loss', 'PDE Loss', 'Norm Loss', 'Ana Loss', 'FFT Loss', 'Mom Loss', 'Ene Loss']
+        colors = ['blue', 'green', 'red', 'orange', 'yellow', 'purple', 'brown', 'black']
+        line_styles = ['-', '--', '-.', ':', '-.', '-.', '-.', '-.']
+        lines = []
+        for i, label in enumerate(labels):
+            line, = ax.semilogy([], [], label=label, color=colors[i], linestyle=line_styles[i], linewidth=2)
+            lines.append(line)
+        ax.set_xlabel('Epoch', fontsize=12)
+        ax.set_ylabel('Loss', fontsize=12)
+        ax.set_title('Real-Time Loss History')
+        ax.legend()
+        ax.grid(True, which='both', linestyle='--', linewidth=0.5)
+
+        # 定义 batch_size 调整计划
         batch_size_schedule = {
-            0: initial_batch_size,  # 起始 batch_size
-            50000: initial_batch_size // 2,  # batch_size 减半
-            100000: initial_batch_size // 4,  # batch_size 再减半
+            0: initial_batch_size,
+            50000: initial_batch_size // 2,
+            100000: initial_batch_size // 4,
         }
 
         for ep in range(1, epochs + 1):
-            # 根据当前 epoch 动态调整 batch_size
-            current_batch_size = None
-            for start_epoch in sorted(batch_size_schedule.keys()):
-                if ep >= start_epoch:
-                    current_batch_size = batch_size_schedule[start_epoch]
-            if current_batch_size is None:
-                current_batch_size = initial_batch_size
+            # 动态 batch_size 调整
+            current_batch_size = max([v for k, v in batch_size_schedule.items() if ep >= k])
 
-            # 计算批次数量
+            # 随机打乱数据
             num_batches = len(self.data) // current_batch_size
-
-            # 在每个 epoch 开始时重置批次索引
             batch_indices = np.arange(len(self.data))
             np.random.shuffle(batch_indices)
 
             for batch_idx in range(num_batches):
-                # 获取当前批次的索引
                 start_idx = batch_idx * current_batch_size
                 end_idx = (batch_idx + 1) * current_batch_size
-
-                # 获取当前批次的数据
                 batch_data = self.data[batch_indices[start_idx:end_idx]]
                 optimizer.zero_grad()
-
-                # 计算当前批次的损失
                 loss, ic, pde, norm, ana, fft, mom, ene = self.loss(batch_data)
-
                 loss.backward(retain_graph=True)
                 optimizer.step()
 
-            # 使用整个数据集的损失来更新学习率调度器
-            # 计算整个数据集的损失
-            total_loss, total_ic, total_pde, total_norm, total_ana, total_fft, total_mom, total_ene = self.loss(self.data)
+            # 每个 epoch 结束后评估一次总损失
+            total_loss, total_ic, total_pde, total_norm, total_ana, total_fft, total_mom, total_ene = self.loss(
+                self.data)
             scheduler.step(total_loss)
 
-            # 记录历史信息
+            # 记录历史
             history['loss'].append(total_loss.item())
             history['ic'].append(total_ic.item())
             history['pde'].append(total_pde.item())
@@ -308,11 +312,21 @@ class Solver3DSpherical:
             history['mom'].append(total_mom.item())
             history['ene'].append(total_ene.item())
 
+            # ========== 实时更新图像 ==========
+            for i, key in enumerate(keys):
+                lines[i].set_data(range(len(history[key])), history[key])
+            ax.relim()
+            ax.autoscale_view()
+            fig.canvas.draw()
+            fig.canvas.flush_events()
+
             if ep % 1 == 0:
                 print(
-                    f"Epoch {ep}/{epochs}, Batch Size: {current_batch_size}, Loss: {total_loss.item():.4e}, IC: {total_ic.item():.4e},"
-                    f"PDE: {total_pde.item():.4e}, norm: {total_norm.item():.4e}, ana: {total_ana.item():.4e}, fft: {total_fft.item():.4e},"
+                    f"Epoch {ep}/{epochs}, Batch Size: {current_batch_size}, Loss: {total_loss.item():.4e}, IC: {total_ic.item():.4e}, "
+                    f"PDE: {total_pde.item():.4e}, norm: {total_norm.item():.4e}, ana: {total_ana.item():.4e}, fft: {total_fft.item():.4e}, "
                     f"mom: {total_mom.item():.4e}, ene: {total_ene.item():.4e}")
+
+        plt.ioff()
         print(f"Training completed in {time() - start:.1f}s")
         return history
 
@@ -422,32 +436,6 @@ def calculate_norm(u, v):
     density = u ** 2 + v ** 2
     mean_density = torch.sqrt(torch.sum(density))
     return mean_density
-
-# 可视化函数
-def plot_history(history, save_path=None):
-    # 创建一个新的图形
-    plt.figure(figsize=(10, 6))  # 设置图形大小
-    # 定义颜色和线条样式
-    colors = ['blue', 'green', 'red', 'purple', 'black', 'orange', 'yellow']
-    line_styles = ['-', '--', '-.', ':', '-.', '-.', '-.']
-    # 绘制每种损失曲线
-    loss_labels = ['Total Loss', 'IC Loss', 'PDE Loss', 'FFT Loss', 'Ana Loss', 'Mom Loss', 'Ene Loss']
-    for i, (key, label) in enumerate(zip(['loss', 'ic', 'pde', 'fft', 'ana', 'mom', 'ene'], loss_labels)):
-        # 确保历史记录中有这个键
-        if key in history:
-            plt.semilogy(history[key], label=label, color=colors[i % len(colors)], linestyle=line_styles[i % len(line_styles)], linewidth=2)
-    # 添加图表元素
-    plt.xlabel('Epoch', fontsize=12)  # 设置x轴标签
-    plt.ylabel('Loss', fontsize=12)   # 设置y轴标签
-    plt.title('Loss History', fontsize=14)  # 设置图表标题
-    plt.legend(fontsize=10)  # 设置图例
-    plt.grid(True, which='both', linestyle='--', linewidth=0.5)  # 添加网格
-    plt.tight_layout()  # 自动调整布局
-    # 保存图表（如果指定了保存路径）
-    if save_path:
-        plt.savefig(os.path.join(save_path, 'loss_history.png'), dpi=300, bbox_inches='tight')
-    # 显示图表
-    plt.show()
 
 # 测试点 只看 φ=pi/6; θ=0; t=0.5截面
 def predict_and_plot(solver, R, k, R0):
