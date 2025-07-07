@@ -28,7 +28,7 @@ class PINN3DSpherical(nn.Module):
     def _init_weights(self):
         for m in self.net:
             if isinstance(m, nn.Linear):
-                nn.init.xavier_normal_(m.weight, gain=nn.init.calculate_gain('tanh'))
+                nn.init.xavier_normal_(m.weight, gain=nn.init.calculate_gain('relu'))
                 nn.init.zeros_(m.bias)
 
     def forward(self, r, theta, phi, t):
@@ -200,7 +200,7 @@ class Solver3DSpherical:
             psi_r_r, psi_r_th, psi_r_p, _ = grad_r
             psi_i_r, psi_i_th, psi_i_p, _ = grad_i
             momentum_r = torch.mean(psi_r * (psi_i_r + psi_i_th + psi_i_p) -
-                                    psi_i * (psi_r_r + psi_r_th + psi_r_p))
+                                    psi_i * (psi_r_r + psi_r_th + psi_r_p)) # 球坐标系下梯度错误
             mse_momentum.append((momentum_r - momentum_r0).pow(2))
 
             # norm
@@ -253,6 +253,7 @@ class Solver3DSpherical:
     def train(self, epochs, initial_batch_size, optimizer):
         scheduler = ReduceLROnPlateau(optimizer, factor=0.5, patience=100)
         history = {'loss': [], 'ic': [], 'pde': [], 'norm': [], 'ana': [], 'fft': [], 'mom': [], 'ene': []}
+        save_path = r'./save_model/training_loss.png'
         start = time()
 
         # ========== 实时绘图设置 ==========
@@ -320,13 +321,15 @@ class Solver3DSpherical:
             fig.canvas.draw()
             fig.canvas.flush_events()
 
-            if ep % 1 == 0:
+            if ep % 100 == 0:
                 print(
                     f"Epoch {ep}/{epochs}, Batch Size: {current_batch_size}, Loss: {total_loss.item():.4e}, IC: {total_ic.item():.4e}, "
                     f"PDE: {total_pde.item():.4e}, norm: {total_norm.item():.4e}, ana: {total_ana.item():.4e}, fft: {total_fft.item():.4e}, "
                     f"mom: {total_mom.item():.4e}, ene: {total_ene.item():.4e}")
 
         plt.ioff()
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close(fig)
         print(f"Training completed in {time() - start:.1f}s")
         return history
 
@@ -573,17 +576,18 @@ if __name__ == '__main__':
     U0_ana, V0_ana = analytic_solution_polar(k, R0, X0)
     # 定义其他时刻 100 个数组归一化数据
     ub1 = np.array([1, 1, 1, 0.5])
-    N1 = 1000
-    t_values = np.linspace(0, 1, 100)
+    t_values = np.linspace(0, 1, 10)
     arrays = []
     for i in range(10):
-        # 拉丁超立方采样生成初始数据
-        sample = lhs(4, samples=1000)  # 4 维，1000 个样本点
-        X = lb + (ub1 - lb) * sample  # 将采样点映射到指定的边界范围内
-        X = cartesian_to_spherical(X)
+        # 每维取几个点（4维空间中每维取10个点 -> 共 10^4 = 10000 个点）
+        n_per_dim = 8
+        grids = [np.linspace(lb[i], ub1[i], n_per_dim) for i in range(4)]
+        # 构建网格点
+        mesh = np.meshgrid(*grids)
+        X = np.vstack([m.flatten() for m in mesh]).T  # shape: (10000, 4)
         # 将当前数组的第四列设置为均匀分布的值
         X[:, 3] = t_values[i]
-        arrays.append(X)
+        arrays.append(X) # 需要转换到球坐标系
     # 定义解析解引导数据
     # ub2 = np.array([1, 1, 1, t])
     # N2 = 30000
@@ -602,14 +606,14 @@ if __name__ == '__main__':
     lr_norm = 1e-10
     lr_ana = 1e-10
     lr_fft = 1e-10
-    lr_mom = 1e6
-    lr_ene = 1e5
+    lr_mom = 1e6*10
+    lr_ene = 1e5*10
 
     n_times = 10  # <<< 新增：时刻个数
     n_fft = 16  # <<< 新增：FFT 网格边长
     # 学习率
     lr = 1e-3
-    epochs = 500
+    epochs = 2000
     # 网络配置
     layers = [4, 128, 128, 2]
     model = PINN3DSpherical(layers)
@@ -620,21 +624,17 @@ if __name__ == '__main__':
     file_path = r'./save_model/save_model.pkl'
 
     if os.path.exists(file_path):
-        # 已经训练完成 直接加载模型
-        checkpoint = torch.load(file_path)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        mean_density = checkpoint['mean_density']
-        print(f"Loaded model weights from {file_path}")
-        # 加载已训练模型 进行模型训练
-        history = solver.train(epochs=15000, initial_batch_size=3000, optimizer=optimizer)
-        # 可视化损失
-        plot_history(history)
-    else:
+    #     # 已经训练完成 直接加载模型
+    #     checkpoint = torch.load(file_path)
+    #     model.load_state_dict(checkpoint['model_state_dict'])
+    #     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    #     mean_density = checkpoint['mean_density']
+    #     print(f"Loaded model weights from {file_path}")
+    #     # 加载已训练模型 进行模型训练
+    #     history = solver.train(epochs=5, initial_batch_size=3000, optimizer=optimizer)
+    # else:
         # 未训练模型 进行模型训练
         history = solver.train(epochs=epochs, initial_batch_size=3000, optimizer=optimizer)
-        # 可视化损失
-        plot_history(history)
         # 保存模型
         torch.save({
             'epoch': epochs,
