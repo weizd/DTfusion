@@ -20,7 +20,7 @@ class PINN3DSpherical(nn.Module):
         seq = []
         for i in range(len(layers) - 2):
             seq.append(nn.Linear(layers[i], layers[i+1]))
-            seq.append(nn.ReLU())
+            seq.append(nn.Tanh())
         seq.append(nn.Linear(layers[-2], layers[-1]))
         self.net = nn.Sequential(*seq)
         self._init_weights()
@@ -28,12 +28,12 @@ class PINN3DSpherical(nn.Module):
     def _init_weights(self):
         for m in self.net:
             if isinstance(m, nn.Linear):
-                nn.init.xavier_normal_(m.weight, gain=nn.init.calculate_gain('relu'))
+                nn.init.xavier_normal_(m.weight, gain=nn.init.calculate_gain('tanh'))
                 nn.init.zeros_(m.bias)
 
-    def forward(self, r, theta, phi, t):
-        inp = torch.cat([r, theta, phi, t], dim=1)
-        out = self.net(inp)
+    def forward(self, x, y, z, t):
+        input = torch.cat([x, y, z, t], dim=1)
+        out = self.net(input)
         u = out[:, 0:1]
         v = out[:, 1:2]
         return u, v
@@ -48,27 +48,27 @@ class Solver3DSpherical:
         self.lr_norm = lr_norm
         self.lr_ana = lr_ana
         self.lr_fft = lr_fft
-        self.lr_mom = lr_mom
+        self.lr_x_mom = lr_mom
+        self.lr_y_mom = lr_mom
+        self.lr_z_mom = lr_mom
         self.lr_ene = lr_ene
         self.n_fft = n_fft
         # n 个均匀时刻
         self.time_points = torch.linspace(0, t,
                                           n_times, device=device)
         # ------- ② 构建一次性空间网格 (n_fft³) -------
-        R_max = 1.0                          # 训练域半径
+        R_max = 1.0  # 空间域边界 [-R_max, R_max]³
         x_lin = torch.linspace(-R_max, R_max, n_fft, device=device)
         y_lin = torch.linspace(-R_max, R_max, n_fft, device=device)
         z_lin = torch.linspace(-R_max, R_max, n_fft, device=device)
-        xx, yy, zz = torch.meshgrid(x_lin, y_lin, z_lin, indexing='ij')
-        rr    = torch.sqrt(xx**2 + yy**2 + zz**2) + 1e-8
-        theta = torch.acos(torch.clamp(zz / rr, -1.0, 1.0))
-        phi   = torch.atan2(yy, xx)
-        phi = (phi + 2 * torch.pi) % (2 * torch.pi)  # 转为 φ ∈ [0, 2π)
 
-        # 展平成 (N_spatial,1)
-        self.r_flat = rr.reshape(-1, 1).float()
-        self.theta_flat = theta.reshape(-1, 1).float()
-        self.phi_flat = phi.reshape(-1, 1).float()
+        # 构造三维笛卡尔网格
+        xx, yy, zz = torch.meshgrid(x_lin, y_lin, z_lin, indexing='ij')
+
+        # 展平成 (N_spatial, 1)
+        self.x_flat = xx.reshape(-1, 1).float()
+        self.y_flat = yy.reshape(-1, 1).float()
+        self.z_flat = zz.reshape(-1, 1).float()
 
         # 模型
         self.model = model.to(device)
@@ -90,14 +90,18 @@ class Solver3DSpherical:
         self.X0 = torch.tensor(X0, dtype=torch.float32, device=device, requires_grad=True)
 
     def schrodinger_residual(self, batch_data):
-        batch_data = batch_data.clone().detach().to(device).requires_grad_(True)
+        """
+        计算直角坐标系下的薛定谔方程残差：
+        i ∂ψ/∂t + ½ Δψ = 0
+        """
         lap_r, lap_i, psi_i_t, psi_r_t = self.laplacian(batch_data)
 
-        # 实/虚部残差： iψ_t + ½Δψ = 0
+        # 实部残差： Re{iψ_t + ½Δψ} = ψ_i_t - ½Δψ_r
+        # 虚部残差： Im{iψ_t + ½Δψ} = -ψ_r_t - ½Δψ_i
         res_r = psi_i_t - 0.5 * lap_r
         res_i = -psi_r_t - 0.5 * lap_i
 
-        # 可选：限制数值发散，避免 inf/NaN
+        # 可选：限制发散
         threshold = 1e5
         res_r = torch.clamp(res_r, -threshold, threshold)
         res_i = torch.clamp(res_i, -threshold, threshold)
@@ -105,103 +109,105 @@ class Solver3DSpherical:
         return res_r, res_i
 
     def split_input_with_grad(self, data):
-        r = data[:, 0:1].clone().detach().to(device).requires_grad_(True)
-        theta = data[:, 1:2].clone().detach().to(device).requires_grad_(True)
-        phi = data[:, 2:3].clone().detach().to(device).requires_grad_(True)
+        """
+        输入数据为 (N, 4): [x, y, z, t]
+        分离出各变量并设置 requires_grad
+        """
+        x = data[:, 0:1].clone().detach().to(device).requires_grad_(True)
+        y = data[:, 1:2].clone().detach().to(device).requires_grad_(True)
+        z = data[:, 2:3].clone().detach().to(device).requires_grad_(True)
         t = data[:, 3:4].clone().detach().to(device).requires_grad_(True)
-        return r, theta, phi, t
+        return x, y, z, t
 
     def laplacian(self, data):
-        """输入为 (N,4): r, θ, φ, t"""
-        r, theta, phi, t = self.split_input_with_grad(data)
+        """计算三维直角坐标下的拉普拉斯项及时间导数"""
+        x, y, z, t = self.split_input_with_grad(data)
+        # print("x.requires_grad =", x.requires_grad)  # 应该为 True
 
-        # ψ_r 和 ψ_i
-        psi_r, psi_i = self.model(r, theta, phi, t)
+        # 模型预测 ψ_r, ψ_i
+        psi_r, psi_i = self.model(x, y, z, t)
 
         # 一阶导数
-        grad_psi_r = torch.autograd.grad(psi_r, [r, theta, phi, t],
-                                         grad_outputs=torch.ones_like(psi_r),
-                                         create_graph=True)
-        grad_psi_i = torch.autograd.grad(psi_i, [r, theta, phi, t],
-                                         grad_outputs=torch.ones_like(psi_i),
-                                         create_graph=True)
+        psi_r_t = torch.autograd.grad(psi_r, t, grad_outputs=torch.ones_like(psi_r), create_graph=True)[0]
+        psi_i_t = torch.autograd.grad(psi_i, t, grad_outputs=torch.ones_like(psi_i), create_graph=True)[0]
 
-        psi_r_r, psi_r_th, psi_r_p, psi_r_t = grad_psi_r
-        psi_i_r, psi_i_th, psi_i_p, psi_i_t = grad_psi_i
+        # 二阶导数用于 Laplacian
+        psi_r_xx = torch.autograd.grad(psi_r, x, grad_outputs=torch.ones_like(psi_r), create_graph=True, allow_unused=True)[0]
+        psi_r_xx = torch.autograd.grad(psi_r_xx, x, grad_outputs=torch.ones_like(psi_r_xx), create_graph=True)[0]
 
-        # 二阶导数
-        psi_r_rr = torch.autograd.grad(psi_r_r, r, grad_outputs=torch.ones_like(psi_r_r), create_graph=True)[0]
-        psi_r_thth = torch.autograd.grad(psi_r_th, theta, grad_outputs=torch.ones_like(psi_r_th), create_graph=True)[0]
-        psi_r_pp = torch.autograd.grad(psi_r_p, phi, grad_outputs=torch.ones_like(psi_r_p), create_graph=True)[0]
+        psi_r_yy = torch.autograd.grad(psi_r, y, grad_outputs=torch.ones_like(psi_r), create_graph=True)[0]
+        psi_r_yy = torch.autograd.grad(psi_r_yy, y, grad_outputs=torch.ones_like(psi_r_yy), create_graph=True)[0]
 
-        psi_i_rr = torch.autograd.grad(psi_i_r, r, grad_outputs=torch.ones_like(psi_i_r), create_graph=True)[0]
-        psi_i_thth = torch.autograd.grad(psi_i_th, theta, grad_outputs=torch.ones_like(psi_i_th), create_graph=True)[0]
-        psi_i_pp = torch.autograd.grad(psi_i_p, phi, grad_outputs=torch.ones_like(psi_i_p), create_graph=True)[0]
+        psi_r_zz = torch.autograd.grad(psi_r, z, grad_outputs=torch.ones_like(psi_r), create_graph=True)[0]
+        psi_r_zz = torch.autograd.grad(psi_r_zz, z, grad_outputs=torch.ones_like(psi_r_zz), create_graph=True)[0]
 
-        sin_theta = torch.sin(theta)
-        cos_theta = torch.cos(theta)
-        sin2_theta = sin_theta ** 2
-        r2 = r ** 2
+        psi_i_xx = torch.autograd.grad(psi_i, x, grad_outputs=torch.ones_like(psi_i), create_graph=True)[0]
+        psi_i_xx = torch.autograd.grad(psi_i_xx, x, grad_outputs=torch.ones_like(psi_i_xx), create_graph=True)[0]
 
-        # Laplacian 计算（球坐标形式）
-        lap_r = (
-                psi_r_rr +
-                2 / r * psi_r_r +
-                1 / r2 * psi_r_thth +
-                cos_theta / (r2 * sin_theta) * psi_r_th +
-                1 / (r2 * sin2_theta) * psi_r_pp
-        )
+        psi_i_yy = torch.autograd.grad(psi_i, y, grad_outputs=torch.ones_like(psi_i), create_graph=True)[0]
+        psi_i_yy = torch.autograd.grad(psi_i_yy, y, grad_outputs=torch.ones_like(psi_i_yy), create_graph=True)[0]
 
-        lap_i = (
-                psi_i_rr +
-                2 / r * psi_i_r +
-                1 / r2 * psi_i_thth +
-                cos_theta / (r2 * sin_theta) * psi_i_th +
-                1 / (r2 * sin2_theta) * psi_i_pp
-        )
+        psi_i_zz = torch.autograd.grad(psi_i, z, grad_outputs=torch.ones_like(psi_i), create_graph=True)[0]
+        psi_i_zz = torch.autograd.grad(psi_i_zz, z, grad_outputs=torch.ones_like(psi_i_zz), create_graph=True)[0]
+
+        # 直角坐标下拉普拉斯
+        lap_r = psi_r_xx + psi_r_yy + psi_r_zz
+        lap_i = psi_i_xx + psi_i_yy + psi_i_zz
 
         return lap_r, lap_i, psi_i_t, psi_r_t
 
     def loss(self, batch_data):
         mse_energy = []
-        mse_momentum = []
+        mse_momentum_x = []
+        mse_momentum_y = []
+        mse_momentum_z = []
         mse_norm = []
-        r0, th0, ph0, t0 = self.split_input_with_grad(self.X0)
-        psi_r0, psi_i0 = self.model(r0, th0, ph0, t0)
+        x0, y0, z0, t0 = self.split_input_with_grad(self.X0)
+        psi_r0, psi_i0 = self.model(x0, y0, z0, t0)
         # 1. 初始能量
         lap_r0, lap_i0, _, _ = self.laplacian(self.X0)
         energy_r0 = torch.mean(psi_r0 * lap_r0 + psi_i0 * lap_i0)
 
         # 2. 初始动量
-        psi_r_r0, psi_r_th0, psi_r_p0, _ = torch.autograd.grad(
-            psi_r0, [r0, th0, ph0, t0],
+        psi_r_x0, psi_r_y0, psi_r_z0, _ = torch.autograd.grad(
+            psi_r0, [x0, y0, z0, t0],
             grad_outputs=torch.ones_like(psi_r0), create_graph=True
         )
-        psi_i_r0, psi_i_th0, psi_i_p0, _ = torch.autograd.grad(
-            psi_i0, [r0, th0, ph0, t0],
+        psi_i_x0, psi_i_y0, psi_i_z0, _ = torch.autograd.grad(
+            psi_i0, [x0, y0, z0, t0],
             grad_outputs=torch.ones_like(psi_i0), create_graph=True
         )
-        momentum_r0 = torch.mean(psi_r0 * (psi_i_r0 + psi_i_th0 + psi_i_p0) -
-                                 psi_i0 * (psi_r_r0 + psi_r_th0 + psi_r_p0))
+        momentum_x0 = torch.mean(psi_r0 * psi_i_x0 -
+                                 psi_i0 * psi_r_x0)
+        momentum_y0 = torch.mean(psi_r0 * psi_i_y0 -
+                                 psi_i0 * psi_r_y0)
+        momentum_z0 = torch.mean(psi_r0 * psi_i_z0 -
+                                 psi_i0 * psi_r_z0)
 
         # 3. 其他时刻
         for i in range(len(self.arrays)):
             arr = torch.tensor(self.arrays[i], dtype=torch.float32, device=device, requires_grad=True)
-            r, th, ph, t = self.split_input_with_grad(arr)
-            psi_r, psi_i = self.model(r, th, ph, t)
+            x, y, z, t = self.split_input_with_grad(arr)
+            psi_r, psi_i = self.model(x, y, z, t)
             # energy
             lap_r, lap_i, _, _ = self.laplacian(arr)
             energy_r = torch.mean(psi_r * lap_r + psi_i * lap_i)
             mse_energy.append((energy_r - energy_r0).pow(2))
 
             # momentum
-            grad_r = torch.autograd.grad(psi_r, [r, th, ph, t], grad_outputs=torch.ones_like(psi_r), create_graph=True)
-            grad_i = torch.autograd.grad(psi_i, [r, th, ph, t], grad_outputs=torch.ones_like(psi_i), create_graph=True)
-            psi_r_r, psi_r_th, psi_r_p, _ = grad_r
-            psi_i_r, psi_i_th, psi_i_p, _ = grad_i
-            momentum_r = torch.mean(psi_r * (psi_i_r + psi_i_th + psi_i_p) -
-                                    psi_i * (psi_r_r + psi_r_th + psi_r_p)) # 球坐标系下梯度错误
-            mse_momentum.append((momentum_r - momentum_r0).pow(2))
+            grad_r = torch.autograd.grad(psi_r, [x, y, z, t], grad_outputs=torch.ones_like(psi_r), create_graph=True)
+            grad_i = torch.autograd.grad(psi_i, [x, y, z, t], grad_outputs=torch.ones_like(psi_i), create_graph=True)
+            psi_r_x, psi_r_y, psi_r_z, _ = grad_r
+            psi_i_x, psi_i_y, psi_i_z, _ = grad_i
+            momentum_x = torch.mean(psi_r * psi_i_x -
+                                    psi_i * psi_r_x)
+            momentum_y = torch.mean(psi_r * psi_i_y -
+                                    psi_i * psi_r_y)
+            momentum_z = torch.mean(psi_r * psi_i_z -
+                                    psi_i * psi_r_z)
+            mse_momentum_x.append((momentum_x - momentum_x0).pow(2))
+            mse_momentum_y.append((momentum_y - momentum_y0).pow(2))
+            mse_momentum_z.append((momentum_z - momentum_z0).pow(2))
 
             # norm
             density = psi_r ** 2 + psi_i ** 2
@@ -209,16 +215,18 @@ class Solver3DSpherical:
             mse_norm.append((mean_density - self.mean_density).pow(2))
 
         mse_energy_total = torch.stack(mse_energy).mean()
-        mse_momentum_total = torch.stack(mse_momentum).mean()
+        mse_momentum_x_total = torch.stack(mse_momentum_x).mean()
+        mse_momentum_y_total = torch.stack(mse_momentum_y).mean()
+        mse_momentum_z_total = torch.stack(mse_momentum_z).mean()
         mse_norm_total = torch.stack(mse_norm).mean()
 
         # 初始条件损失
-        u0_pred, v0_pred = self.model(r0, th0, ph0, t0)
+        u0_pred, v0_pred = self.model(x0, y0, z0, t0)
         mse_ic = torch.mean((u0_pred - self.u0) ** 2) + torch.mean((v0_pred - self.v0) ** 2)
 
         # 解析引导损失
-        r2, th2, ph2, t2 = self.split_input_with_grad(self.X2)
-        u2_pred, v2_pred = self.model(r2, th2, ph2, t2)
+        x2, y2, z2, t2 = self.split_input_with_grad(self.X2)
+        u2_pred, v2_pred = self.model(x2, y2, z2, t2)
         mse_ana = torch.mean((u2_pred - self.u2) ** 2) + torch.mean((v2_pred - self.v2) ** 2)
 
         # PDE 残差
@@ -228,8 +236,8 @@ class Solver3DSpherical:
         # FFT 损失
         mse_fft = 0.0
         for t_val in self.time_points:
-            t_flat = t_val.repeat(self.r_flat.shape[0], 1)
-            psi_r, psi_i = self.model(self.r_flat, self.theta_flat, self.phi_flat, t_flat)
+            t_flat = t_val.repeat(self.x_flat.shape[0], 1)
+            psi_r, psi_i = self.model(self.x_flat, self.y_flat, self.z_flat, t_flat)
             psi_complex = (psi_r.squeeze(-1) + 1j * psi_i.squeeze(-1)).reshape(self.n_fft, self.n_fft, self.n_fft)
             fft_vals = torch.fft.fftn(psi_complex, dim=(0, 1, 2), norm='forward')
             const_mod = torch.abs(fft_vals[0, 0, 0])
@@ -242,27 +250,30 @@ class Solver3DSpherical:
         mse_norm_total = mse_norm_total * self.lr_norm
         mse_ana = mse_ana * self.lr_ana
         mse_fft = mse_fft * self.lr_fft
-        mse_momentum_total = mse_momentum_total * self.lr_mom
+        mse_momentum_x_total = mse_momentum_x_total * self.lr_x_mom
+        mse_momentum_y_total = mse_momentum_y_total * self.lr_y_mom
+        mse_momentum_z_total = mse_momentum_z_total * self.lr_z_mom
         mse_energy_total = mse_energy_total * self.lr_ene
 
         total_loss = (mse_ic + mse_pde + mse_norm_total + mse_ana +
-                      mse_fft + mse_momentum_total + mse_energy_total)
+                      mse_fft + mse_momentum_x_total + mse_momentum_y_total + mse_momentum_z_total + mse_energy_total)
 
-        return total_loss, mse_ic, mse_pde, mse_norm_total, mse_ana, mse_fft, mse_momentum_total, mse_energy_total
+        return (total_loss, mse_ic, mse_pde, mse_norm_total, mse_ana, mse_fft,
+                mse_momentum_x_total, mse_momentum_y_total, mse_momentum_z_total, mse_energy_total)
 
     def train(self, epochs, initial_batch_size, optimizer):
         scheduler = ReduceLROnPlateau(optimizer, factor=0.5, patience=100)
-        history = {'loss': [], 'ic': [], 'pde': [], 'norm': [], 'ana': [], 'fft': [], 'mom': [], 'ene': []}
+        history = {'loss': [], 'ic': [], 'pde': [], 'norm': [], 'ana': [], 'fft': [], 'mom_x': [], 'mom_y': [], 'mom_z': [], 'ene': []}
         save_path = r'./save_model/training_loss.png'
         start = time()
 
         # ========== 实时绘图设置 ==========
         plt.ion()  # 打开交互模式
         fig, ax = plt.subplots(figsize=(10, 6))
-        keys = ['loss', 'ic', 'pde', 'norm', 'ana', 'fft', 'mom', 'ene']
-        labels = ['Total Loss', 'IC Loss', 'PDE Loss', 'Norm Loss', 'Ana Loss', 'FFT Loss', 'Mom Loss', 'Ene Loss']
-        colors = ['blue', 'green', 'red', 'orange', 'yellow', 'purple', 'brown', 'black']
-        line_styles = ['-', '--', '-.', ':', '-.', '-.', '-.', '-.']
+        keys = ['loss', 'ic', 'pde', 'norm', 'ana', 'fft', 'mom_x', 'mom_y', 'mom_z', 'ene']
+        labels = ['Total Loss', 'IC Loss', 'PDE Loss', 'Mom_x Loss', 'Mom_y Loss', 'Mom_z Loss', 'Ene Loss', 'Norm Loss', 'Ana Loss', 'FFT Loss']
+        colors = ['blue', 'green', 'red', 'orange', 'yellow', 'purple', 'brown', 'white', 'white', 'white']
+        line_styles = ['-', '--', '-.', ':', '-.', '-.', '-.', '-.', '-.', '-.']
         lines = []
         for i, label in enumerate(labels):
             line, = ax.semilogy([], [], label=label, color=colors[i], linestyle=line_styles[i], linewidth=2)
@@ -294,12 +305,13 @@ class Solver3DSpherical:
                 end_idx = (batch_idx + 1) * current_batch_size
                 batch_data = self.data[batch_indices[start_idx:end_idx]]
                 optimizer.zero_grad()
-                loss, ic, pde, norm, ana, fft, mom, ene = self.loss(batch_data)
+                loss, ic, pde, norm, ana, fft, mom_x, mom_y, mom_z, ene = self.loss(batch_data)
                 loss.backward(retain_graph=True)
                 optimizer.step()
 
             # 每个 epoch 结束后评估一次总损失
-            total_loss, total_ic, total_pde, total_norm, total_ana, total_fft, total_mom, total_ene = self.loss(
+            (total_loss, total_ic, total_pde, total_norm, total_ana, total_fft,
+             total_mom_x, total_mom_y, total_mom_z, total_ene) = self.loss(
                 self.data)
             scheduler.step(total_loss)
 
@@ -307,10 +319,12 @@ class Solver3DSpherical:
             history['loss'].append(total_loss.item())
             history['ic'].append(total_ic.item())
             history['pde'].append(total_pde.item())
-            history['norm'].append(total_norm.item())
-            history['ana'].append(total_ana.item())
-            history['fft'].append(total_fft.item())
-            history['mom'].append(total_mom.item())
+            # history['norm'].append(total_norm.item())
+            # history['ana'].append(total_ana.item())
+            # history['fft'].append(total_fft.item())
+            history['mom_x'].append(total_mom_x.item())
+            history['mom_y'].append(total_mom_y.item())
+            history['mom_z'].append(total_mom_z.item())
             history['ene'].append(total_ene.item())
 
             # ========== 实时更新图像 ==========
@@ -321,11 +335,11 @@ class Solver3DSpherical:
             fig.canvas.draw()
             fig.canvas.flush_events()
 
-            if ep % 100 == 0:
+            if ep % 1 == 0:
                 print(
                     f"Epoch {ep}/{epochs}, Batch Size: {current_batch_size}, Loss: {total_loss.item():.4e}, IC: {total_ic.item():.4e}, "
                     f"PDE: {total_pde.item():.4e}, norm: {total_norm.item():.4e}, ana: {total_ana.item():.4e}, fft: {total_fft.item():.4e}, "
-                    f"mom: {total_mom.item():.4e}, ene: {total_ene.item():.4e}")
+                    f"mom_x: {total_mom_x.item():.4e}, mom_y: {total_mom_y.item():.4e}, mom_z: {total_mom_z.item():.4e}, ene: {total_ene.item():.4e}")
 
         plt.ioff()
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
@@ -334,105 +348,88 @@ class Solver3DSpherical:
         return history
 
 
-def analytic_solution_polar(K, R, X, delta=1, m=1):
-    # 自由粒子在三维极坐标下高斯波包的解析解（Hartree 单位制：ℏ=1, m=1）。
-    # x: (N,4) -> [r, θ, φ, t]
-    # k: (N,3) -> [k0, θ0, φ0]
-    # r0: 默认与r方向一致
+def analytic_solution_cartesian(K, R, X, delta=1, m=1):
+    """
+    自由粒子在三维直角坐标下高斯波包的解析解（Hartree 单位制：ℏ=1, m=1）。
+    X: (N,4) -> [x, y, z, t]
+    K: (3,)  -> [k_x, k_y, k_z]
+    R: (3,)  -> [x0, y0, z0]
+    """
     delta = torch.tensor(delta, dtype=torch.float32, device=device)
-    k0 = torch.tensor(K[0], dtype=torch.float32, device=device)
-    theta_k = torch.tensor(K[1], dtype=torch.float32, device=device)
-    phi_k = torch.tensor(K[2], dtype=torch.float32, device=device)
+    m = torch.tensor(m, dtype=torch.float32, device=device)
 
-    r = torch.tensor(X[:, 0:1], dtype=torch.float32, device=device, requires_grad=True)
-    theta_r = torch.tensor(X[:, 1:2], dtype=torch.float32, device=device, requires_grad=True)
-    phi_r = torch.tensor(X[:, 2:3], dtype=torch.float32, device=device, requires_grad=True)
-    t = torch.tensor(X[:, 3:4], dtype=torch.float32, device=device, requires_grad=True)
+    kx, ky, kz = [torch.tensor(k, dtype=torch.float32, device=device) for k in K]
+    x0, y0, z0 = [torch.tensor(r, dtype=torch.float32, device=device) for r in R]
 
-    r0 = torch.tensor(R[0], dtype=torch.float32, device=device)
-    theta_r0 = torch.tensor(R[1], dtype=torch.float32, device=device)
-    phi_r0 = torch.tensor(R[2], dtype=torch.float32, device=device)
+    X_tensor = torch.tensor(X, dtype=torch.float32, device=device)
+    x = X_tensor[:, 0:1]
+    y = X_tensor[:, 1:2]
+    z = X_tensor[:, 2:3]
+    t = X_tensor[:, 3:4]
 
-    # 1. 宽度演化 σ = Δ^2 + i t / (2m)
+    # 1. σ(t): 宽度随时间演化
     sigma = delta ** 2 + 1j * t / (2 * m)
+
     # 2. 归一化因子
     norm = (2 * torch.pi * (delta + 1j * t / (2 * m * delta)) ** 2) ** (-3 / 4)
-    # 3. 极坐标 → 笛卡尔转换
-    x_r = r * torch.sin(theta_r) * torch.cos(phi_r)
-    y_r = r * torch.sin(theta_r) * torch.sin(phi_r)
-    z_r = r * torch.cos(theta_r)
 
-    x0 = r0 * torch.sin(theta_r0) * torch.cos(phi_r0)
-    y0 = r0 * torch.sin(theta_r0) * torch.sin(phi_r0)
-    z0 = r0 * torch.cos(theta_r0)
+    # 3. 波包中心位置随时间变化（漂移项）
+    dx = (kx / m) * t
+    dy = (ky / m) * t
+    dz = (kz / m) * t
+    xc = x0 + dx
+    yc = y0 + dy
+    zc = z0 + dz
 
-    x_k = k0 * torch.sin(theta_k) * torch.cos(phi_k)
-    y_k = k0 * torch.sin(theta_k) * torch.sin(phi_k)
-    z_k = k0 * torch.cos(theta_k)
-    # 4. 移动距离 = (k0/m) * t
-    drx = (x_k / m) * t
-    dry = (y_k / m) * t
-    drz = (z_k / m) * t
+    # 4. |r - r_c(t)|^2
+    dx2 = (x - xc) ** 2 + (y - yc) ** 2 + (z - zc) ** 2
 
-    xs = x0 + drx
-    ys = y0 + dry
-    zs = z0 + drz
-    # 5. 计算 [r-(r0+(k0/m)*t)]^2
-    dx2 = (x_r - xs) ** 2 + (y_r - ys) ** 2 + (z_r - zs) ** 2
-    # 6. 相位项： k·r - (k0^2/(2m))t
-    # 极坐标系下：k·r = k0 * r * (sinφ_k * sinφ_r  * cos(θ_k-θ_r) + cosφ_k * cosφ_r)
-    phase_arg = (k0 * r * (
-            torch.sin(phi_k) * torch.sin(phi_r) * torch.cos(theta_k - theta_r)
-            + torch.cos(phi_k) * torch.cos(phi_r)
-        )
-        - (k0 ** 2 / (2 * m)) * t
-    )
-    # 7. 构造解析解
+    # 5. 相位项：k·r - (k^2)/(2m)t
+    phase_arg = (kx * x + ky * y + kz * z - (kx ** 2 + ky ** 2 + kz ** 2) / (2 * m) * t)
+
+    # 6. 波函数表达式
     psi = norm * torch.exp(-dx2 / (4 * sigma) + 1j * phase_arg)
     psi_real = psi.real
     psi_imag = psi.imag
 
     return psi_real, psi_imag
 
+
 # 初始条件
-def initial_wave_spherical(k, R0, X0, delta):
-    # x: (N,4) -> [r, θ, φ, t]
-    # k: (N,3) -> [k0, θ0, φ0]
+def initial_wave_cartesian(k, R0, X0, delta):
+    """
+    初始波函数在直角坐标系下的形式。
+    X0: (N,3) -> [x, y, z]
+    k:  (3,)  -> [kx, ky, kz]
+    R0: (3,)  -> [x0, y0, z0]
+    delta: 标准差（波包宽度）
+    """
     delta = torch.tensor(delta, dtype=torch.float32, device=device)
-    k0 = torch.tensor(k[0], dtype=torch.float32, device=device)
-    theta_k = torch.tensor(k[1], dtype=torch.float32, device=device)
-    phi_k = torch.tensor(k[2], dtype=torch.float32, device=device)
 
-    r = torch.tensor(X0[:, 0:1], dtype=torch.float32, device=device)
-    theta_r = torch.tensor(X0[:, 1:2], dtype=torch.float32, device=device)
-    phi_r = torch.tensor(X0[:, 2:3], dtype=torch.float32, device=device)
+    kx, ky, kz = [torch.tensor(v, dtype=torch.float32, device=device) for v in k]
+    x0, y0, z0 = [torch.tensor(v, dtype=torch.float32, device=device) for v in R0]
 
-    r0 = torch.tensor(R0[0], dtype=torch.float32, device=device)
-    theta_r0 = torch.tensor(R0[1], dtype=torch.float32, device=device)
-    phi_r0 = torch.tensor(R0[2], dtype=torch.float32, device=device)
-    # 参数
+    X0_tensor = torch.tensor(X0, dtype=torch.float32, device=device)
+    x = X0_tensor[:, 0:1]
+    y = X0_tensor[:, 1:2]
+    z = X0_tensor[:, 2:3]
+
+    # 常数项
     A = (2 * torch.pi * delta ** 2) ** (-3 / 4)
-    # 极坐标 → 笛卡尔转换
-    x_r = r * torch.sin(theta_r) * torch.cos(phi_r)
-    y_r = r * torch.sin(theta_r) * torch.sin(phi_r)
-    z_r = r * torch.cos(theta_r)
 
-    x_r0 = r0 * torch.sin(theta_r0) * torch.cos(phi_r0)
-    y_r0 = r0 * torch.sin(theta_r0) * torch.sin(phi_r0)
-    z_r0 = r0 * torch.cos(theta_r0)
-    # 计算矢量（r-r0）**2
-    r_r0_2 = (x_r - x_r0) ** 2 + (y_r - y_r0) ** 2 + (z_r - z_r0) ** 2
+    # |r - r0|^2
+    r_r0_sq = (x - x0) ** 2 + (y - y0) ** 2 + (z - z0) ** 2
+    envelope = torch.exp(-r_r0_sq / (4 * delta ** 2))
 
-    envelope = torch.exp(-r_r0_2 / (4 * delta ** 2))
-    # 极坐标系下：k·r = k0 * r * (sinφ_k * sinφ_r  * cos(θ_k-θ_r) + cosφ_k * cosφ_r)
-    phase_arg = (k0 * r * (
-            torch.sin(phi_k) * torch.sin(phi_r) * torch.cos(theta_k - theta_r)
-            + torch.cos(phi_k) * torch.cos(phi_r)
-        )
-    )
+    # 相位项：k·r
+    phase_arg = kx * x + ky * y + kz * z
+
+    # 波函数实部与虚部
     psi_r = A * envelope * torch.cos(phase_arg)
     psi_i = A * envelope * torch.sin(phase_arg)
+
     return psi_r, psi_i
+
 
 # 计算归一化数值
 def calculate_norm(u, v):
@@ -440,52 +437,52 @@ def calculate_norm(u, v):
     mean_density = torch.sqrt(torch.sum(density))
     return mean_density
 
-# 测试点 只看 φ=pi/6; θ=0; t=0.5截面
-def predict_and_plot(solver, R, k, R0):
+# 测试点 y=0; z=0; t=0.5截面
+def predict_and_plot(solver, k, R0):
     N = 100
-    phi = np.pi/6
-    theta = 0
+    z = 0
+    y = 0
     t = 0.5
-    r = np.linspace(0, R, N)
-    phi_test = np.full((1, N), phi)
-    theta_test = np.full((1, N), theta)
+    x = np.linspace(-2, 2, N)
+    y_test = np.full((1, N), y)
+    z_test = np.full((1, N), z)
     t_test = np.full((1, N), t)
-    r_phi_theta_test = np.vstack([r, theta_test, phi_test, t_test]).T
+    x_y_z_test = np.vstack([x, y_test, z_test, t_test]).T
     # 解析解
-    psi_exact_real, psi_exact_imag = analytic_solution_polar(k, R0, r_phi_theta_test)
+    psi_exact_real, psi_exact_imag = analytic_solution_cartesian(k, R0, x_y_z_test)
     psi_exact_real =psi_exact_real.cpu().detach().numpy()
     psi_exact_imag = psi_exact_imag.cpu().detach().numpy()
     # PINN 预测
-    rf = torch.tensor(r_phi_theta_test[:,0:1], dtype=torch.float32, device=device, requires_grad=True)
-    thf = torch.tensor(r_phi_theta_test[:,1:2], dtype=torch.float32, device=device, requires_grad=True)
-    phf = torch.tensor(r_phi_theta_test[:,2:3], dtype=torch.float32, device=device, requires_grad=True)
-    tf = torch.tensor(r_phi_theta_test[:,3:4], dtype=torch.float32, device=device, requires_grad=True)
-    psi_pinn_real, psi_pinn_imag = solver.model(rf, thf, phf, tf)
+    xf = torch.tensor(x_y_z_test[:,0:1], dtype=torch.float32, device=device)
+    yf = torch.tensor(x_y_z_test[:,1:2], dtype=torch.float32, device=device)
+    zf = torch.tensor(x_y_z_test[:,2:3], dtype=torch.float32, device=device)
+    tf = torch.tensor(x_y_z_test[:,3:4], dtype=torch.float32, device=device)
+    psi_pinn_real, psi_pinn_imag = solver.model(xf, yf, zf, tf)
     psi_pinn_real =psi_pinn_real.cpu().detach().numpy()
     psi_pinn_imag = psi_pinn_imag.cpu().detach().numpy()
     # 绘图对比
     plt.figure(figsize=(8, 4))
-    plt.plot(r, psi_exact_real, '--', label='Analytic Real', color='red', linewidth=2) # 注意负号
-    plt.plot(r, psi_pinn_real, '-', label='PINN Real', color='red', linewidth=2)
-    plt.plot(r, psi_exact_imag, '--', label='Analytic Imag', color='black', linewidth=2)
-    plt.plot(r, psi_pinn_imag, '-', label='PINN Imag', color='black', linewidth=2)
-    plt.xlabel('r')
+    plt.plot(x, psi_exact_real, '--', label='Analytic Real', color='red', linewidth=2) # 注意负号
+    plt.plot(x, psi_pinn_real, '-', label='PINN Real', color='red', linewidth=2)
+    plt.plot(x, psi_exact_imag, '--', label='Analytic Imag', color='black', linewidth=2)
+    plt.plot(x, psi_pinn_imag, '-', label='PINN Imag', color='black', linewidth=2)
+    plt.xlabel('x')
     plt.ylabel(r'$\psi$')
-    plt.title(f'Wavefunction slice at phi={phi:.2f}, theta={theta}, t={t}')
+    plt.title(f'Wavefunction slice at y={y}, z={z}, t={t}')
     plt.legend()
     plt.tight_layout()
     plt.show()
 
-# 绘制 φ=pi/6; θ=0全时空实部、虚部和振幅偏差
-def calculate_and_plot_diffs(solver, R, k, R0):
+# 绘制 y=0; z=0 全时空实部、虚部和振幅偏差
+def calculate_and_plot_diffs(solver, k, R0):
     # 定义时间范围
     t_values = np.linspace(0, 1, 100)
     N = 100
-    phi = np.pi/6
-    theta = 0
-    r = np.linspace(0, R, N)
-    phi_test = np.full((1, N), phi)
-    theta_test = np.full((1, N), theta)
+    z = 0
+    y = 0
+    x = np.linspace(-2, 2, N)
+    y = np.full((1, N), y)
+    z = np.full((1, N), z)
 
     real_diffs = []
     imag_diffs = []
@@ -493,16 +490,16 @@ def calculate_and_plot_diffs(solver, R, k, R0):
 
     for t in t_values:
         t_test = np.full((1, N), t)
-        r_phi_theta_test_all = np.vstack([r, theta_test, phi_test, t_test]).T
-        rf = torch.tensor(r_phi_theta_test_all[:, 0:1], dtype=torch.float32, device=device, requires_grad=True)
-        thf = torch.tensor(r_phi_theta_test_all[:, 1:2], dtype=torch.float32, device=device, requires_grad=True)
-        phf = torch.tensor(r_phi_theta_test_all[:, 2:3], dtype=torch.float32, device=device, requires_grad=True)
-        tf = torch.tensor(r_phi_theta_test_all[:, 3:4], dtype=torch.float32, device=device, requires_grad=True)
-        psi_pinn_real, psi_pinn_imag = solver.model(rf, thf, phf, tf)
+        x_y_z_test_all = np.vstack([x, y, z, t_test]).T
+        xf = torch.tensor(x_y_z_test_all[:, 0:1], dtype=torch.float32, device=device)
+        yf = torch.tensor(x_y_z_test_all[:, 1:2], dtype=torch.float32, device=device)
+        zf = torch.tensor(x_y_z_test_all[:, 2:3], dtype=torch.float32, device=device)
+        tf = torch.tensor(x_y_z_test_all[:, 3:4], dtype=torch.float32, device=device)
+        psi_pinn_real, psi_pinn_imag = solver.model(xf, yf, zf, tf)
         psi_pinn_real = psi_pinn_real.cpu().detach().numpy()
         psi_pinn_imag = psi_pinn_imag.cpu().detach().numpy()
 
-        psi_exact_real, psi_exact_imag = analytic_solution_polar(k, R0, r_phi_theta_test_all)
+        psi_exact_real, psi_exact_imag = analytic_solution_cartesian(k, R0, x_y_z_test_all)
         psi_exact_real = psi_exact_real.cpu().detach().numpy()
         psi_exact_imag = psi_exact_imag.cpu().detach().numpy()
         psi_pinn = psi_pinn_real + 1j * psi_pinn_imag
@@ -530,53 +527,38 @@ def calculate_and_plot_diffs(solver, R, k, R0):
 
     for i in range(3):
         ax = fig.add_subplot(gs[0, i])
-        im = ax.imshow(diffs[i], extent=[t_values.min(), t_values.max(), r.min(), r.max()],
+        im = ax.imshow(diffs[i], extent=[t_values.min(), t_values.max(), x.min(), x.max()],
                        aspect='auto', origin='lower', cmap=cmaps[i])
         ax.set_xlabel('Time (t)')
-        ax.set_ylabel('r')
+        ax.set_ylabel('x')
         ax.set_title(labels[i])
         plt.colorbar(im, ax=ax)
 
     plt.show()
 
 
-def cartesian_to_spherical(X_f):
-    x = X_f[:, 0]
-    y = X_f[:, 1]
-    z = X_f[:, 2]
-    r = np.sqrt(x**2 + y**2 + z**2)
-    theta = np.arccos(z / r)                  # 极角 θ ∈ [0, π]
-    phi = np.arctan2(y, x)                    # 方位角 φ ∈ [−π, π]
-    phi = (phi + 2 * np.pi) % (2 * np.pi)     # 转为 φ ∈ [0, 2π)
-    t = X_f[:, 3]
-    return np.stack((r, theta, phi, t), axis=1)
-
-
-
 # 主函数示例
 if __name__ == '__main__':
-    R = 1.0
+    B = 3.0 # 边界
     t = 1.0
     # 其他数据
-    k = np.array([4*R, np.pi, 0.0]) # 初始动量（传播方向与起始矢量相反）
-    R0 = np.array([R, 0.0, 0.0]) # 起始坐标（起始位置放置中心0）
-    delta = np.array(1.0) # 波包宽度参数
+    k = np.array([1.0, 0, 0.0]) # 初始动量
+    R0 = np.array([0.0, 0.0, 0.0]) # 起始坐标（起始位置放置中心0）
+    delta = np.array(0.5) # 波包宽度参数
     m = np.array(1.0) # 质量
-    lb = np.array([-1.0, -1.0, -1.0, 0.0])
+    lb = np.array([-B, -B, -B, 0.0])
     # 定义所有训练点数据
-    ub = np.array([1, 1, 1, t])
+    ub = np.array([B, B, B, t])
     Nf = 30000
-    X_f = lb + (ub - lb) * lhs(4, Nf)  #直角坐标系下取点转换为极坐标系
-    X_f = cartesian_to_spherical(X_f)
+    X_f = lb + (ub - lb) * lhs(4, Nf)
     # 定义初始时刻数据
-    ub0 = np.array([1, 1, 1, 0])
+    ub0 = np.array([B, B, B, 0.1])
     N0 = 10000
     X0 = lb + (ub0 - lb) * lhs(4, N0)
-    X0 = cartesian_to_spherical(X0)
-    U0_ana, V0_ana = analytic_solution_polar(k, R0, X0)
+    U0_ana, V0_ana = analytic_solution_cartesian(k, R0, X0)
     # 定义其他时刻 100 个数组归一化数据
-    ub1 = np.array([1, 1, 1, 0.5])
-    t_values = np.linspace(0, 1, 10)
+    ub1 = np.array([B, B, B, 0.5])
+    t_values = np.linspace(0.1, 1, 10)
     arrays = []
     for i in range(10):
         # 每维取几个点（4维空间中每维取10个点 -> 共 10^4 = 10000 个点）
@@ -587,16 +569,12 @@ if __name__ == '__main__':
         X = np.vstack([m.flatten() for m in mesh]).T  # shape: (10000, 4)
         # 将当前数组的第四列设置为均匀分布的值
         X[:, 3] = t_values[i]
-        arrays.append(X) # 需要转换到球坐标系
+        arrays.append(X)
     # 定义解析解引导数据
-    # ub2 = np.array([1, 1, 1, t])
-    # N2 = 30000
-    # X2 = lb + (ub2 - lb) * lhs(4, N2)
-    # X2 = cartesian_to_spherical(X2)
-    U2, V2 = analytic_solution_polar(k, R0, X_f)
+    U2, V2 = analytic_solution_cartesian(k, R0, X_f)
     ana_mean_density = calculate_norm(U0_ana, V0_ana)
     # 初始条件
-    U0, V0 = initial_wave_spherical(k, R0, X0, delta)
+    U0, V0 = initial_wave_cartesian(k, R0, X0, delta)
     mean_density = calculate_norm(U0, V0)
     print("ana_mean_density - mean_density =", ana_mean_density - mean_density) # 同一时刻下计算归一化值
 
@@ -613,7 +591,7 @@ if __name__ == '__main__':
     n_fft = 16  # <<< 新增：FFT 网格边长
     # 学习率
     lr = 1e-3
-    epochs = 2000
+    epochs = 100
     # 网络配置
     layers = [4, 128, 128, 2]
     model = PINN3DSpherical(layers)
@@ -643,9 +621,9 @@ if __name__ == '__main__':
             'mean_density': mean_density
         }, file_path)
 
-    # 测试点 只看 φ=pi/6; θ=0; t=0.5截面
-    predict_and_plot(solver, R, k, R0)
-    # 绘制 φ=pi/6; θ=0全时空实部、虚部和振幅偏差
-    calculate_and_plot_diffs(solver, R, k, R0)
+    # 测试点 只看 z=0; t=0.5截面
+    predict_and_plot(solver, k, R0)
+    # 绘制 z=0全时空实部、虚部和振幅偏差
+    calculate_and_plot_diffs(solver, k, R0)
 
 
