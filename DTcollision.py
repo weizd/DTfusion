@@ -40,8 +40,10 @@ class PINN3DSpherical(nn.Module):
 
 # 求解器
 class Solver3DSpherical:
-    def __init__(self, model, X0, X_f, arrays, X2, U2, V2,
-                 t, n_times, n_fft, lr_ic, lr_pde, lr_norm, lr_ana, lr_fft, lr_mom, lr_ene):
+    def __init__(self, model, X0, X_f, arrays, U2, V2,
+                 x_flat, y_flat, z_flat, n_fft, time_points,
+                 k, R0, delta,
+                 lr_ic, lr_pde, lr_norm, lr_ana, lr_fft, lr_mom, lr_ene):
 
         self.lr_ic = lr_ic
         self.lr_pde = lr_pde
@@ -52,29 +54,24 @@ class Solver3DSpherical:
         self.lr_y_mom = lr_mom
         self.lr_z_mom = lr_mom
         self.lr_ene = lr_ene
+
+        # 构建一次性空间网格 (n_fft³)
         self.n_fft = n_fft
-        # n 个均匀时刻
-        self.time_points = torch.linspace(0, t,
-                                          n_times, device=device)
-        # ------- ② 构建一次性空间网格 (n_fft³) -------
-        R_max = 1.0  # 空间域边界 [-R_max, R_max]³
-        x_lin = torch.linspace(-R_max, R_max, n_fft, device=device)
-        y_lin = torch.linspace(-R_max, R_max, n_fft, device=device)
-        z_lin = torch.linspace(-R_max, R_max, n_fft, device=device)
-
-        # 构造三维笛卡尔网格
-        xx, yy, zz = torch.meshgrid(x_lin, y_lin, z_lin, indexing='ij')
-
-        # 展平成 (N_spatial, 1)
-        self.x_flat = xx.reshape(-1, 1).float()
-        self.y_flat = yy.reshape(-1, 1).float()
-        self.z_flat = zz.reshape(-1, 1).float()
+        self.time_points = time_points
+        self.x_flat = x_flat
+        self.y_flat = y_flat
+        self.z_flat = z_flat
 
         # 模型
         self.model = model.to(device)
 
+        # 初始参数
+        self.k = k  # 初始动量
+        self.R0 = R0  # 起始坐标（起始位置放置中心0）
+        self.delta = delta  # 波包宽度参数
+
         # 解析解引导数据
-        self.X2 = X2
+        self.X2 = X_f
         self.u2 = U2
         self.v2 = V2
         # 原始大数量数组
@@ -349,13 +346,10 @@ class Solver3DSpherical:
         R0: (3,)  -> [x0, y0, z0]
         delta: 标准差（波包宽度）
         """
-        k = np.array([1.0, 0, 0.0])  # 初始动量
-        R0 = np.array([0.0, 0.0, 0.0])  # 起始坐标（起始位置放置中心0）
-        delta = np.array(0.5)  # 波包宽度参数
-        delta = torch.tensor(delta, dtype=torch.float32, device=device)
+        delta = torch.tensor(self.delta, dtype=torch.float32, device=device)
 
-        kx, ky, kz = [torch.tensor(v, dtype=torch.float32, device=device) for v in k]
-        x0, y0, z0 = [torch.tensor(v, dtype=torch.float32, device=device) for v in R0]
+        kx, ky, kz = [torch.tensor(v, dtype=torch.float32, device=device) for v in self.k]
+        x0, y0, z0 = [torch.tensor(v, dtype=torch.float32, device=device) for v in self.R0]
 
         X0_tensor = torch.tensor(X0, dtype=torch.float32, device=device)
         x = X0_tensor[:, 0:1]
@@ -383,19 +377,15 @@ class Solver3DSpherical:
         拉普拉斯算子作用下的复波函数：∇²ψ
         返回：实部、虚部
         """
-        k = np.array([1.0, 0, 0.0])  # 初始动量
-        R0 = np.array([0.0, 0.0, 0.0])  # 起始坐标（起始位置放置中心0）
-        delta = np.array(0.5)  # 波包宽度参数
-        delta = torch.tensor(delta, dtype=torch.float32, device=device)
+        delta = torch.tensor(self.delta, dtype=torch.float32, device=device)
 
-        kx, ky, kz = [torch.tensor(v, dtype=torch.float32, device=device) for v in k]
-        x0, y0, z0 = [torch.tensor(v, dtype=torch.float32, device=device) for v in R0]
+        kx, ky, kz = [torch.tensor(v, dtype=torch.float32, device=device) for v in self.k]
+        x0, y0, z0 = [torch.tensor(v, dtype=torch.float32, device=device) for v in self.R0]
 
         X0_tensor = torch.tensor(X0, dtype=torch.float32, device=device)
         x = X0_tensor[:, 0:1]
         y = X0_tensor[:, 1:2]
         z = X0_tensor[:, 2:3]
-        # x, y, z, t = self.split_input_with_grad(X0)
 
         pi = torch.pi
         delta2 = delta ** 2
@@ -433,19 +423,15 @@ class Solver3DSpherical:
         梯度 ∇ψ(x, y, z)：返回复梯度的三个方向分量（gx, gy, gz）
         """
 
-        k = np.array([1.0, 0, 0.0])  # 初始动量
-        R0 = np.array([0.0, 0.0, 0.0])  # 起始坐标（起始位置放置中心0）
-        delta = np.array(0.5)  # 波包宽度参数
-        delta = torch.tensor(delta, dtype=torch.float32, device=device)
+        delta = torch.tensor(self.delta, dtype=torch.float32, device=device)
 
-        kx, ky, kz = [torch.tensor(v, dtype=torch.float32, device=device) for v in k]
-        x0, y0, z0 = [torch.tensor(v, dtype=torch.float32, device=device) for v in R0]
+        kx, ky, kz = [torch.tensor(v, dtype=torch.float32, device=device) for v in self.k]
+        x0, y0, z0 = [torch.tensor(v, dtype=torch.float32, device=device) for v in self.R0]
 
         X0_tensor = torch.tensor(X0, dtype=torch.float32, device=device)
         x = X0_tensor[:, 0:1]
         y = X0_tensor[:, 1:2]
         z = X0_tensor[:, 2:3]
-        # x, y, z, t= self.split_input_with_grad(X0)
 
         pi = torch.pi
         delta2 = delta ** 2
@@ -483,7 +469,7 @@ class Solver3DSpherical:
         mean_density = torch.sqrt(torch.sum(density))
         return mean_density
 
-def analytic_solution_cartesian(K, R, X, delta=1, m=1):
+def analytic_solution_cartesian(K, R, X, delta, m=1.0):
     """
     自由粒子在三维直角坐标下高斯波包的解析解（Hartree 单位制：ℏ=1, m=1）。
     X: (N,4) -> [x, y, z, t]
@@ -531,7 +517,7 @@ def analytic_solution_cartesian(K, R, X, delta=1, m=1):
 
 
 # 测试点 y=0; z=0; t=0.5截面
-def predict_and_plot(solver, k, R0):
+def predict_and_plot(solver, k, R0, delta):
     N = 100
     z = 0
     y = 0
@@ -542,7 +528,7 @@ def predict_and_plot(solver, k, R0):
     t_test = np.full((1, N), t)
     x_y_z_test = np.vstack([x, y_test, z_test, t_test]).T
     # 解析解
-    psi_exact_real, psi_exact_imag = analytic_solution_cartesian(k, R0, x_y_z_test)
+    psi_exact_real, psi_exact_imag = analytic_solution_cartesian(k, R0, x_y_z_test, delta)
     psi_exact_real =psi_exact_real.cpu().detach().numpy()
     psi_exact_imag = psi_exact_imag.cpu().detach().numpy()
     # PINN 预测
@@ -567,7 +553,7 @@ def predict_and_plot(solver, k, R0):
     plt.show()
 
 # 绘制 y=0; z=0 全时空实部、虚部和振幅偏差
-def calculate_and_plot_diffs(solver, k, R0):
+def calculate_and_plot_diffs(solver, k, R0, delta):
     # 定义时间范围
     t_values = np.linspace(0, 1, 100)
     N = 100
@@ -592,7 +578,7 @@ def calculate_and_plot_diffs(solver, k, R0):
         psi_pinn_real = psi_pinn_real.cpu().detach().numpy()
         psi_pinn_imag = psi_pinn_imag.cpu().detach().numpy()
 
-        psi_exact_real, psi_exact_imag = analytic_solution_cartesian(k, R0, x_y_z_test_all)
+        psi_exact_real, psi_exact_imag = analytic_solution_cartesian(k, R0, x_y_z_test_all, delta)
         psi_exact_real = psi_exact_real.cpu().detach().numpy()
         psi_exact_imag = psi_exact_imag.cpu().detach().numpy()
         psi_pinn = psi_pinn_real + 1j * psi_pinn_imag
@@ -639,6 +625,8 @@ if __name__ == '__main__':
     R0 = np.array([0.0, 0.0, 0.0]) # 起始坐标（起始位置放置中心0）
     delta = np.array(0.5) # 波包宽度参数
     m = np.array(1.0) # 质量
+
+
     lb = np.array([-B, -B, -B, 0.0])
     # 定义所有训练点数据
     ub = np.array([B, B, B, t])
@@ -648,9 +636,9 @@ if __name__ == '__main__':
     ub0 = np.array([B, B, B, 0.1])
     N0 = 1000
     X0 = lb + (ub0 - lb) * lhs(4, N0)
-    U0_ana, V0_ana = analytic_solution_cartesian(k, R0, X0)
+    U0_ana, V0_ana = analytic_solution_cartesian(k, R0, X0, delta)
     # 定义解析解引导数据
-    U2, V2 = analytic_solution_cartesian(k, R0, X_f)
+    U2, V2 = analytic_solution_cartesian(k, R0, X_f, delta)
 
     # 定义其他时刻 100 个数组归一化数据
     ub1 = np.array([B, B, B, 0.5])
@@ -678,14 +666,32 @@ if __name__ == '__main__':
 
     n_times = 10  # <<< 新增：时刻个数
     n_fft = 16  # <<< 新增：FFT 网格边长
+    # n 个均匀时刻
+    time_points = torch.linspace(0, t,
+                                      n_times, device=device)
+    #构建一次性空间网格 (n_fft³)
+    # 空间域边界 [-B, B]³
+    x_lin = torch.linspace(-B, B, n_fft, device=device)
+    y_lin = torch.linspace(-B, B, n_fft, device=device)
+    z_lin = torch.linspace(-B, B, n_fft, device=device)
+
+    # 构造三维笛卡尔网格
+    xx, yy, zz = torch.meshgrid(x_lin, y_lin, z_lin, indexing='ij')
+
+    # 展平成 (N_spatial, 1)
+    x_flat = xx.reshape(-1, 1).float()
+    y_flat = yy.reshape(-1, 1).float()
+    z_flat = zz.reshape(-1, 1).float()
     # 学习率
     lr = 1e-3
     epochs = 10
     # 网络配置
     layers = [4, 128, 128, 2]
     model = PINN3DSpherical(layers)
-    solver = Solver3DSpherical(model, X0, X_f, arrays, X_f, U2, V2,
-                               t, n_times, n_fft, lr_ic, lr_pde, lr_norm, lr_ana, lr_fft, lr_mom, lr_ene)
+    solver = Solver3DSpherical(model, X0, X_f, arrays, U2, V2,
+                               x_flat, y_flat, z_flat,  n_fft, time_points,
+                               k, R0, delta,
+                               lr_ic, lr_pde, lr_norm, lr_ana, lr_fft, lr_mom, lr_ene)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
     # 初始条件
@@ -717,8 +723,8 @@ if __name__ == '__main__':
         }, file_path)
 
     # 测试点 只看 z=0; t=0.5截面
-    predict_and_plot(solver, k, R0)
+    predict_and_plot(solver, k, R0, delta)
     # 绘制 z=0全时空实部、虚部和振幅偏差
-    calculate_and_plot_diffs(solver, k, R0)
+    calculate_and_plot_diffs(solver, k, R0, delta)
 
 
