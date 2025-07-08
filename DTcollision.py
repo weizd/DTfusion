@@ -517,12 +517,12 @@ def analytic_solution_cartesian(K, R, X, delta, m=1.0):
 
 
 # 测试点 y=0; z=0; t=0.5截面
-def predict_and_plot(solver, k, R0, delta):
+def predict_and_plot(solver, B, k, R0, delta):
     N = 100
     z = 0
     y = 0
     t = 0.5
-    x = np.linspace(-5, 5, N)
+    x = np.linspace(-B, B, N)
     y_test = np.full((1, N), y)
     z_test = np.full((1, N), z)
     t_test = np.full((1, N), t)
@@ -553,7 +553,7 @@ def predict_and_plot(solver, k, R0, delta):
     plt.show()
 
 # 绘制 y=0; z=0 全时空实部、虚部和振幅偏差
-def calculate_and_plot_diffs(solver, k, R0, delta):
+def calculate_and_plot_diffs(solver, B, k, R0, delta):
     # 定义时间范围
     t_values = np.linspace(0, 1, 100)
     N = 100
@@ -723,8 +723,8 @@ if __name__ == '__main__':
         }, file_path)
 
     # 测试点 只看 z=0; t=0.5截面
-    predict_and_plot(solver, k, R0, delta)
+    predict_and_plot(solver, B, k, R0, delta)
     # 绘制 z=0全时空实部、虚部和振幅偏差
-    calculate_and_plot_diffs(solver, k, R0, delta)
+    calculate_and_plot_diffs(solver, B, k, R0, delta)
 
 
