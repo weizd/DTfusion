@@ -6,6 +6,7 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
 from time import time
+from datetime import datetime  # 用于时间戳
 from pyDOE import lhs
 
 # 设置设备
@@ -630,11 +631,11 @@ if __name__ == '__main__':
     lb = np.array([-B, -B, -B, 0.0])
     # 定义所有训练点数据
     ub = np.array([B, B, B, t])
-    Nf = 3000
+    Nf = 30000
     X_f = lb + (ub - lb) * lhs(4, Nf)
     # 定义初始时刻数据
     ub0 = np.array([B, B, B, 0.1])
-    N0 = 1000
+    N0 = 10000
     X0 = lb + (ub0 - lb) * lhs(4, N0)
     U0_ana, V0_ana = analytic_solution_cartesian(k, R0, X0, delta)
     # 定义解析解引导数据
@@ -646,7 +647,7 @@ if __name__ == '__main__':
     arrays = []
     for i in range(10):
         # 每维取几个点（4维空间中每维取10个点 -> 共 10^4 = 10000 个点）
-        n_per_dim = 8
+        n_per_dim = 6
         grids = [np.linspace(lb[i], ub1[i], n_per_dim) for i in range(4)]
         # 构建网格点
         mesh = np.meshgrid(*grids)
@@ -656,13 +657,13 @@ if __name__ == '__main__':
         arrays.append(X)
 
     # 损失函数权重
-    lr_ic = 10
+    lr_ic = 0.1
     lr_pde = 1.0
     lr_norm = 1e-10
     lr_ana = 1e-10
     lr_fft = 1e-10
-    lr_mom = 1e6*10
-    lr_ene = 1e5*10
+    lr_mom = 1e3
+    lr_ene = 1e2
 
     n_times = 10  # <<< 新增：时刻个数
     n_fft = 16  # <<< 新增：FFT 网格边长
@@ -683,8 +684,8 @@ if __name__ == '__main__':
     y_flat = yy.reshape(-1, 1).float()
     z_flat = zz.reshape(-1, 1).float()
     # 学习率
-    lr = 1e-3
-    epochs = 10
+    lr = 1e-1
+    epochs = 5
     # 网络配置
     layers = [4, 128, 128, 2]
     model = PINN3DSpherical(layers)
@@ -699,28 +700,38 @@ if __name__ == '__main__':
     U0, V0 = solver.initial_wave_cartesian(X0)
     mean_density = solver.calculate_norm(U0, V0)
     print("ana_mean_density - mean_density =", ana_mean_density - mean_density) # 同一时刻下计算归一化值
-    # 保存模型
-    file_path = r'./save_model/save_model.pkl'
 
+    file_path = './save_model/save_model.pkl000'
+    start_epoch = 0
     if os.path.exists(file_path):
-    #     # 已经训练完成 直接加载模型
-    #     checkpoint = torch.load(file_path)
-    #     model.load_state_dict(checkpoint['model_state_dict'])
-    #     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    #     mean_density = checkpoint['mean_density']
-    #     print(f"Loaded model weights from {file_path}")
-    #     # 加载已训练模型 进行模型训练
-    #     history = solver.train(epochs=5, initial_batch_size=3000, optimizer=optimizer)
-    # else:
-        # 未训练模型 进行模型训练
-        history = solver.train(epochs=epochs, initial_batch_size=3000, optimizer=optimizer)
-        # 保存模型
-        torch.save({
-            'epoch': epochs,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'mean_density': mean_density
-        }, file_path)
+        checkpoint = torch.load(file_path)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+
+        # 覆盖旧学习率
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr
+
+        mean_density = checkpoint['mean_density']
+        start_epoch = checkpoint.get('epoch', 0)
+        print(f"Loaded model weights from {file_path}")
+
+    # 训练模型
+    history = solver.train(epochs=epochs, initial_batch_size=3000, optimizer=optimizer)
+
+    # 保存模型到一个带时间戳的文件中
+    now = datetime.now().strftime('%m%d_%H%M')
+    save_path = f'./save_model/model_epoch{start_epoch}_{epochs}_{now}.pkl'
+
+    torch.save({
+        'epoch': start_epoch + epochs,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'mean_density': mean_density
+    }, save_path)
+
+    print(f"Model saved to: {save_path}")
+
 
     # 测试点 只看 z=0; t=0.5截面
     predict_and_plot(solver, B, k, R0, delta)
