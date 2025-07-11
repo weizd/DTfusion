@@ -644,10 +644,9 @@ if __name__ == '__main__':
     # 定义其他时刻 100 个数组归一化数据
     ub1 = np.array([B, B, B, 0.5])
     t_values = np.linspace(0.1, 1, 10)
+    n_per_dim = 6   # 每维取几个点（4维空间中每维取10个点 -> 共 10^4 = 10000 个点）
     arrays = []
     for i in range(10):
-        # 每维取几个点（4维空间中每维取10个点 -> 共 10^4 = 10000 个点）
-        n_per_dim = 6
         grids = [np.linspace(lb[i], ub1[i], n_per_dim) for i in range(4)]
         # 构建网格点
         mesh = np.meshgrid(*grids)
@@ -684,10 +683,10 @@ if __name__ == '__main__':
     y_flat = yy.reshape(-1, 1).float()
     z_flat = zz.reshape(-1, 1).float()
     # 学习率
-    lr = 1e-1
+    lr = 1e-3
     epochs = 5
     # 网络配置
-    layers = [4, 128, 128, 2]
+    layers = [4, 64, 64, 64, 64, 2]
     model = PINN3DSpherical(layers)
     solver = Solver3DSpherical(model, X0, X_f, arrays, U2, V2,
                                x_flat, y_flat, z_flat,  n_fft, time_points,
@@ -701,7 +700,7 @@ if __name__ == '__main__':
     mean_density = solver.calculate_norm(U0, V0)
     print("ana_mean_density - mean_density =", ana_mean_density - mean_density) # 同一时刻下计算归一化值
 
-    file_path = './save_model/save_model.pkl000'
+    file_path = './save_model/model_epoch1000_2000_0710_2119.pkl' # 有这个文件则代表在此基础上训练
     start_epoch = 0
     if os.path.exists(file_path):
         checkpoint = torch.load(file_path)
@@ -721,7 +720,7 @@ if __name__ == '__main__':
 
     # 保存模型到一个带时间戳的文件中
     now = datetime.now().strftime('%m%d_%H%M')
-    save_path = f'./save_model/model_epoch{start_epoch}_{epochs}_{now}.pkl'
+    save_path = f'./save_model/model_epoch{start_epoch}_{start_epoch+epochs}_{now}.pkl'
 
     torch.save({
         'epoch': start_epoch + epochs,
@@ -737,5 +736,46 @@ if __name__ == '__main__':
     predict_and_plot(solver, B, k, R0, delta)
     # 绘制 z=0全时空实部、虚部和振幅偏差
     calculate_and_plot_diffs(solver, B, k, R0, delta)
+
+    # === 保存参数信息到 txt 文件 ===
+    param_txt_path = save_path.replace('.pkl', '_params.txt')
+
+    with open(param_txt_path, 'w') as f:
+        f.write("=== 模型训练参数记录 ===\n")
+        f.write(f"模型保存时间：{now}\n")
+        f.write(f"模型路径：{save_path}\n")
+        f.write(f"初始 epoch：{start_epoch}\n")
+        f.write(f"总训练 epoch：{epochs}\n")
+        f.write(f"最终 epoch：{start_epoch + epochs}\n")
+        f.write(f"学习率：{lr}\n")
+        f.write(f"网络结构：{layers}\n")
+        f.write("\n=== 物理参数 ===\n")
+        f.write(f"质量 m：{m}\n")
+        f.write(f"波包宽度 delta：{delta}\n")
+        f.write(f"初始动量 k：{k}\n")
+        f.write(f"初始位置 R0：{R0}\n")
+        f.write(f"空间边界 B：{B}\n")
+        f.write(f"时间终点 t：{t}\n")
+        f.write("\n=== 损失函数权重 ===\n")
+        f.write(f"lr_ic: {lr_ic}\n")
+        f.write(f"lr_pde: {lr_pde}\n")
+        f.write(f"lr_norm: {lr_norm}\n")
+        f.write(f"lr_ana: {lr_ana}\n")
+        f.write(f"lr_fft: {lr_fft}\n")
+        f.write(f"lr_mom: {lr_mom}\n")
+        f.write(f"lr_ene: {lr_ene}\n")
+        f.write("\n=== FFT / 网格参数 ===\n")
+        f.write(f"n_fft: {n_fft}\n")
+        f.write(f"n_times: {n_times}\n")
+        f.write(f"time_points: {time_points.cpu().numpy()}\n")
+        f.write(f"x_flat.shape: {x_flat.shape}\n")
+        f.write("\n=== 其它参数 ===\n")
+        f.write(f"n_per_dim: {n_per_dim}\n")  # 每维取几个点（4维空间中每维取10个点 -> 共 10^4 = 10000 个点）
+        f.write(f"X0.shape: {X0.shape}\n")
+        f.write(f"X_f.shape: {X_f.shape}\n")
+        f.write(f"解析解数组数量: {len(arrays)}\n")
+
+    print(f"参数信息保存到: {param_txt_path}")
+
 
 
