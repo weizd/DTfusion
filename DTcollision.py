@@ -684,7 +684,7 @@ if __name__ == '__main__':
     z_flat = zz.reshape(-1, 1).float()
     # 学习率
     lr = 1e-3
-    epochs = 5
+    epochs = 10
     # 网络配置
     layers = [4, 64, 64, 64, 64, 2]
     model = PINN3DSpherical(layers)
@@ -700,7 +700,7 @@ if __name__ == '__main__':
     mean_density = solver.calculate_norm(U0, V0)
     print("ana_mean_density - mean_density =", ana_mean_density - mean_density) # 同一时刻下计算归一化值
 
-    file_path = './save_model/model_epoch1000_2000_0710_2119.pkl' # 有这个文件则代表在此基础上训练
+    file_path = './save_model/model_epoch8000_9000_0711_1650.pkl' # 有这个文件则代表在此基础上训练
     start_epoch = 0
     if os.path.exists(file_path):
         checkpoint = torch.load(file_path)
@@ -726,7 +726,11 @@ if __name__ == '__main__':
         'epoch': start_epoch + epochs,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
-        'mean_density': mean_density
+        'mean_density': mean_density,
+        'X0': X0,
+        'X_f': X_f,
+        'arrays': arrays,
+        'final_loss': history,
     }, save_path)
 
     print(f"Model saved to: {save_path}")
