@@ -41,10 +41,15 @@ class PINN3DSpherical(nn.Module):
 
 # 求解器
 class Solver3DSpherical:
-    def __init__(self, model, X0, X_f, arrays, U2, V2,
+    def __init__(self, model, B, t, Nf,
+                 X0, X_f, U2, V2,
                  x_flat, y_flat, z_flat, n_fft, time_points,
                  k, R0, delta,
                  lr_ic, lr_pde, lr_norm, lr_ana, lr_fft, lr_mom, lr_ene):
+
+        self.B = B
+        self.t = t
+        self.N_r = Nf
 
         self.lr_ic = lr_ic
         self.lr_pde = lr_pde
@@ -77,10 +82,29 @@ class Solver3DSpherical:
         self.v2 = V2
         # 原始大数量数组
         self.data = X_f
-        # 其他时刻归一化数据集合
-        self.arrays = arrays
         # 初始时刻总采样点
         self.X0 = X0
+
+    # 其他时刻归一化数据集合
+    def grid_generator(self, n_per_dim):
+        t_values = np.linspace(0, self.t, 10)
+        ub1 = np.array([self.B, self.B, self.B, 0.5])
+        lb = np.array([-self.B, -self.B, -self.B, 0.0])
+        for t in t_values:
+            grids = [np.linspace(lb[j], ub1[j], n_per_dim) for j in range(4)]
+            mesh = np.meshgrid(*grids)
+            X = np.vstack([m.ravel() for m in mesh]).T
+            X[:, 3] = t
+            yield X  # 每次只返回一个时间步的数据
+
+    def update_residual_points(self, X_f_new, U2_new, V2_new):
+        """
+        动态更新 PDE 残差点和解析引导数据
+        """
+        self.X2 = X_f
+        self.data = X_f
+        self.U2 = U2_new
+        self.V2 = V2_new
 
     def schrodinger_residual(self, batch_data):
         """
@@ -157,51 +181,53 @@ class Solver3DSpherical:
         mse_momentum_z = []
         mse_norm = []
 
+
         # 计算动量、能量损失
-        for i in range(len(self.arrays)):
-            psi_r0, psi_i0 = self.initial_wave_cartesian(arrays[0])
-            # 1. 初始能量
-            lap_r0, lap_i0 = self.laplacian_ini_psi(arrays[0])
-            self.energy_r0 = torch.mean(psi_r0 * lap_r0 + psi_i0 * lap_i0)
+        for arrays in self.grid_generator(8):
+            if arrays[0, 3] == 0:
+                psi_r0, psi_i0 = self.initial_wave_cartesian(arrays)
+                # 1. 初始能量
+                lap_r0, lap_i0 = self.laplacian_ini_psi(arrays)
+                self.energy_r0 = torch.mean(psi_r0 * lap_r0 + psi_i0 * lap_i0)
 
-            # 2. 初始动量
-            psi_r_x0, psi_i_x0, psi_r_y0, psi_i_y0, psi_r_z0, psi_i_z0 = self.grad_ini_psi(arrays[0])
+                # 2. 初始动量
+                psi_r_x0, psi_i_x0, psi_r_y0, psi_i_y0, psi_r_z0, psi_i_z0 = self.grad_ini_psi(arrays)
 
-            self.momentum_x0 = torch.mean(psi_r0 * psi_i_x0 -
-                                     psi_i0 * psi_r_x0)
-            self.momentum_y0 = torch.mean(psi_r0 * psi_i_y0 -
-                                     psi_i0 * psi_r_y0)
-            self.momentum_z0 = torch.mean(psi_r0 * psi_i_z0 -
-                                     psi_i0 * psi_r_z0)
+                self.momentum_x0 = torch.mean(psi_r0 * psi_i_x0 -
+                                         psi_i0 * psi_r_x0)
+                self.momentum_y0 = torch.mean(psi_r0 * psi_i_y0 -
+                                         psi_i0 * psi_r_y0)
+                self.momentum_z0 = torch.mean(psi_r0 * psi_i_z0 -
+                                         psi_i0 * psi_r_z0)
+            else:
+                # 3. 其他时刻
+                x, y, z, t = self.split_input_with_grad(arrays)
+                psi_r, psi_i = self.model(x, y, z, t)
+                # energy
+                lap_r, lap_i, _, _ = self.laplacian(arrays)
+                energy_r = torch.mean(psi_r * lap_r + psi_i * lap_i)
+                mse_energy.append((energy_r - self.energy_r0).pow(2))
 
-            # 3. 其他时刻
-            x, y, z, t = self.split_input_with_grad(arrays[i])
-            psi_r, psi_i = self.model(x, y, z, t)
-            # energy
-            lap_r, lap_i, _, _ = self.laplacian(arrays[i])
-            energy_r = torch.mean(psi_r * lap_r + psi_i * lap_i)
-            mse_energy.append((energy_r - self.energy_r0).pow(2))
+                # momentum
+                grad_r = torch.autograd.grad(psi_r, [x, y, z, t], grad_outputs=torch.ones_like(psi_r), create_graph=True)
+                grad_i = torch.autograd.grad(psi_i, [x, y, z, t], grad_outputs=torch.ones_like(psi_i), create_graph=True)
+                psi_r_x, psi_r_y, psi_r_z, _ = grad_r
+                psi_i_x, psi_i_y, psi_i_z, _ = grad_i
+                momentum_x = torch.mean(psi_r * psi_i_x -
+                                        psi_i * psi_r_x)
+                momentum_y = torch.mean(psi_r * psi_i_y -
+                                        psi_i * psi_r_y)
+                momentum_z = torch.mean(psi_r * psi_i_z -
+                                        psi_i * psi_r_z)
+                mse_momentum_x.append((momentum_x - self.momentum_x0).pow(2))
+                mse_momentum_y.append((momentum_y - self.momentum_y0).pow(2))
+                mse_momentum_z.append((momentum_z - self.momentum_z0).pow(2))
 
-            # momentum
-            grad_r = torch.autograd.grad(psi_r, [x, y, z, t], grad_outputs=torch.ones_like(psi_r), create_graph=True)
-            grad_i = torch.autograd.grad(psi_i, [x, y, z, t], grad_outputs=torch.ones_like(psi_i), create_graph=True)
-            psi_r_x, psi_r_y, psi_r_z, _ = grad_r
-            psi_i_x, psi_i_y, psi_i_z, _ = grad_i
-            momentum_x = torch.mean(psi_r * psi_i_x -
-                                    psi_i * psi_r_x)
-            momentum_y = torch.mean(psi_r * psi_i_y -
-                                    psi_i * psi_r_y)
-            momentum_z = torch.mean(psi_r * psi_i_z -
-                                    psi_i * psi_r_z)
-            mse_momentum_x.append((momentum_x - self.momentum_x0).pow(2))
-            mse_momentum_y.append((momentum_y - self.momentum_y0).pow(2))
-            mse_momentum_z.append((momentum_z - self.momentum_z0).pow(2))
-
-            # norm
-            mean_density = self.calculate_norm(psi_r, psi_i) # 其他时刻密度
-            u0, v0 = self.initial_wave_cartesian(self.X0)
-            mean_density0 = self.calculate_norm(u0, v0) # 初始时刻密度
-            mse_norm.append((mean_density - mean_density0).pow(2))
+                # norm
+                mean_density = self.calculate_norm(psi_r, psi_i) # 其他时刻密度
+                u0, v0 = self.initial_wave_cartesian(self.X0)
+                mean_density0 = self.calculate_norm(u0, v0) # 初始时刻密度
+                mse_norm.append((mean_density - mean_density0).pow(2))
 
         mse_energy_total = torch.stack(mse_energy).mean()
         mse_momentum_x_total = torch.stack(mse_momentum_x).mean()
@@ -252,7 +278,7 @@ class Solver3DSpherical:
         return (total_loss, mse_ic, mse_pde, mse_norm_total, mse_ana, mse_fft,
                 mse_momentum_x_total, mse_momentum_y_total, mse_momentum_z_total, mse_energy_total)
 
-    def train(self, epochs, initial_batch_size, optimizer):
+    def train(self, epochs, initial_batch_size, optimizer, resample_every):
         scheduler = ReduceLROnPlateau(optimizer, factor=0.5, patience=100)
         history = {'loss': [], 'ic': [], 'pde': [], 'norm': [], 'ana': [], 'fft': [], 'mom_x': [], 'mom_y': [], 'mom_z': [], 'ene': []}
         save_path = r'./save_model/training_loss.png'
@@ -261,7 +287,7 @@ class Solver3DSpherical:
         # ========== 实时绘图设置 ==========
         plt.ion()  # 打开交互模式
         fig, ax = plt.subplots(figsize=(10, 6))
-        keys = ['loss', 'ic', 'pde', 'mom_x', 'mom_y', 'mom_z', 'ene', 'norm', 'ana', 'fft']
+        keys = ['loss', 'ic', 'pde', 'mom_x', 'mom_y', 'mom_z', 'ene']
         labels = ['Total Loss', 'IC Loss', 'PDE Loss', 'Mom_x Loss', 'Mom_y Loss', 'Mom_z Loss', 'Ene Loss', 'Norm Loss', 'Ana Loss', 'FFT Loss']
         colors = ['blue', 'green', 'red', 'orange', 'yellow', 'purple', 'brown', 'white', 'white', 'white']
         line_styles = ['-', '--', '-.', ':', '-.', '-.', '-.', '-.', '-.', '-.']
@@ -278,11 +304,19 @@ class Solver3DSpherical:
         # 定义 batch_size 调整计划
         batch_size_schedule = {
             0: initial_batch_size,
-            50000: initial_batch_size // 2,
-            100000: initial_batch_size // 4,
+            5000000: initial_batch_size // 2,
+            10000000: initial_batch_size // 4,
         }
 
         for ep in range(1, epochs + 1):
+
+            # 每隔 resample_every 轮重新采样残差点
+            if resample_every is not None and ep % resample_every == 0:
+                print(f"\n[Resampling X_f at epoch {ep}]")
+                X_f_new = self.r3_sampling(N_r=self.N_r, max_iterations=2)
+                U2_new, V2_new = analytic_solution_cartesian(self.k, self.R0, X_f_new, self.delta)
+                self.update_residual_points(X_f_new, U2_new, V2_new)
+
             # 动态 batch_size 调整
             current_batch_size = max([v for k, v in batch_size_schedule.items() if ep >= k])
 
@@ -329,7 +363,8 @@ class Solver3DSpherical:
             if ep % 1 == 0:
                 print(
                     f"Epoch {ep}/{epochs}, Batch Size: {current_batch_size}, Loss: {total_loss.item():.4e}, IC: {total_ic.item():.4e}, "
-                    f"PDE: {total_pde.item():.4e}, norm: {total_norm.item():.4e}, ana: {total_ana.item():.4e}, fft: {total_fft.item():.4e}, "
+                    f"PDE: {total_pde.item():.4e},"
+                    # f" norm: {total_norm.item():.4e}, ana: {total_ana.item():.4e}, fft: {total_fft.item():.4e}, "
                     f"mom_x: {total_mom_x.item():.4e}, mom_y: {total_mom_y.item():.4e}, mom_z: {total_mom_z.item():.4e}, ene: {total_ene.item():.4e}")
 
         plt.ioff()
@@ -469,6 +504,39 @@ class Solver3DSpherical:
         density = u ** 2 + v ** 2
         mean_density = torch.sqrt(torch.sum(density))
         return mean_density
+
+    def r3_sampling(self, N_r, max_iterations):
+        """
+        R3 sampling for residual points based on PDE residuals.
+
+        Parameters:
+            N_r: number of residual points
+            max_iterations: number of R3 iterations
+        Returns:
+            X_r: updated residual points (N_r, 4)
+        """
+        B = self.B  # 边界
+        t = self.t
+        lb = np.array([-B, -B, -B, 0.0])
+        # 定义所有训练点数据
+        ub = np.array([B, B, B, t])
+        X_r = lb + (ub - lb) * lhs(4, N_r)
+
+        for _ in range(max_iterations):
+
+            res_r, res_i = self.schrodinger_residual(X_r)
+            residual = torch.sqrt(res_r ** 2 + res_i ** 2).detach().cpu().numpy().flatten()
+
+            tau = np.mean(residual)
+            retained_mask = residual > tau
+            X_retained = X_r[retained_mask]
+
+            N_new = N_r - X_retained.shape[0]
+            X_new = lb + (ub - lb) * lhs(4, N_new)
+
+            X_r = np.vstack([X_retained, X_new])
+
+        return X_r
 
 def analytic_solution_cartesian(K, R, X, delta, m=1.0):
     """
@@ -642,18 +710,7 @@ if __name__ == '__main__':
     U2, V2 = analytic_solution_cartesian(k, R0, X_f, delta)
 
     # 定义其他时刻 100 个数组归一化数据
-    ub1 = np.array([B, B, B, 0.5])
-    t_values = np.linspace(0.1, 1, 10)
-    n_per_dim = 6   # 每维取几个点（4维空间中每维取10个点 -> 共 10^4 = 10000 个点）
-    arrays = []
-    for i in range(10):
-        grids = [np.linspace(lb[i], ub1[i], n_per_dim) for i in range(4)]
-        # 构建网格点
-        mesh = np.meshgrid(*grids)
-        X = np.vstack([m.flatten() for m in mesh]).T  # shape: (10000, 4)
-        # 将当前数组的第四列设置为均匀分布的值
-        X[:, 3] = t_values[i]
-        arrays.append(X)
+
 
     # 损失函数权重
     lr_ic = 0.1
@@ -684,11 +741,12 @@ if __name__ == '__main__':
     z_flat = zz.reshape(-1, 1).float()
     # 学习率
     lr = 1e-3
-    epochs = 10
+    epochs = 1000
     # 网络配置
     layers = [4, 64, 64, 64, 64, 2]
     model = PINN3DSpherical(layers)
-    solver = Solver3DSpherical(model, X0, X_f, arrays, U2, V2,
+    solver = Solver3DSpherical(model, B, t, Nf,
+                               X0, X_f, U2, V2,
                                x_flat, y_flat, z_flat,  n_fft, time_points,
                                k, R0, delta,
                                lr_ic, lr_pde, lr_norm, lr_ana, lr_fft, lr_mom, lr_ene)
@@ -716,7 +774,7 @@ if __name__ == '__main__':
         print(f"Loaded model weights from {file_path}")
 
     # 训练模型
-    history = solver.train(epochs=epochs, initial_batch_size=3000, optimizer=optimizer)
+    history = solver.train(epochs=epochs, initial_batch_size=3000, optimizer=optimizer, resample_every=100)
 
     # 保存模型到一个带时间戳的文件中
     now = datetime.now().strftime('%m%d_%H%M')
@@ -729,7 +787,6 @@ if __name__ == '__main__':
         'mean_density': mean_density,
         'X0': X0,
         'X_f': X_f,
-        'arrays': arrays,
         'final_loss': history,
     }, save_path)
 
@@ -774,10 +831,10 @@ if __name__ == '__main__':
         f.write(f"time_points: {time_points.cpu().numpy()}\n")
         f.write(f"x_flat.shape: {x_flat.shape}\n")
         f.write("\n=== 其它参数 ===\n")
-        f.write(f"n_per_dim: {n_per_dim}\n")  # 每维取几个点（4维空间中每维取10个点 -> 共 10^4 = 10000 个点）
+        # f.write(f"n_per_dim: {n_per_dim}\n")  # 每维取几个点（4维空间中每维取10个点 -> 共 10^4 = 10000 个点）
         f.write(f"X0.shape: {X0.shape}\n")
         f.write(f"X_f.shape: {X_f.shape}\n")
-        f.write(f"解析解数组数量: {len(arrays)}\n")
+        # f.write(f"解析解数组数量: {len(arrays)}\n")
 
     print(f"参数信息保存到: {param_txt_path}")
 
