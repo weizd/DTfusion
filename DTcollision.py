@@ -101,10 +101,10 @@ class Solver3DSpherical:
         """
         动态更新 PDE 残差点和解析引导数据
         """
-        self.X2 = X_f
-        self.data = X_f
-        self.U2 = U2_new
-        self.V2 = V2_new
+        self.X2 = X_f_new
+        self.data = X_f_new
+        self.u2 = U2_new
+        self.v2 = V2_new
 
     def schrodinger_residual(self, batch_data):
         """
@@ -454,6 +454,7 @@ class Solver3DSpherical:
         # 分离实部和虚部
         return torch.real(psi_lap), torch.imag(psi_lap)
 
+
     def grad_ini_psi(self, X0):
         """
         梯度 ∇ψ(x, y, z)：返回复梯度的三个方向分量（gx, gy, gz）
@@ -590,9 +591,12 @@ def predict_and_plot(solver, B, k, R0, delta):
     N = 100
     z = 0
     y = 0
+    # x = 0
     t = 0.5
-    x = np.linspace(-B, B, N)
+    x = np.linspace(-10, 10, N)
+    # x = np.full((1, N), x)
     y_test = np.full((1, N), y)
+    # y_test = np.linspace(-10, 10, N)
     z_test = np.full((1, N), z)
     t_test = np.full((1, N), t)
     x_y_z_test = np.vstack([x, y_test, z_test, t_test]).T
@@ -628,7 +632,7 @@ def calculate_and_plot_diffs(solver, B, k, R0, delta):
     N = 100
     z = 0
     y = 0
-    x = np.linspace(-2, 2, N)
+    x = np.linspace(-B, B, N)
     y = np.full((1, N), y)
     z = np.full((1, N), z)
 
@@ -685,6 +689,116 @@ def calculate_and_plot_diffs(solver, B, k, R0, delta):
     plt.show()
 
 
+def normalize_wavefunction(psi_r, psi_i, dV=1.0):
+    rho = psi_r**2 + psi_i**2
+    # rho = torch.tensor(rho, dtype=torch.float32, device=device)
+    norm = torch.sqrt(torch.sum(rho) * dV)
+    return psi_r / norm, psi_i / norm
+
+def overlap_integral(psi_r1, psi_i1, psi_r2, psi_i2, dV=1.0):
+    real_part = psi_r1 * psi_r2 + psi_i1 * psi_i2
+    imag_part = psi_r1 * psi_i2 - psi_i1 * psi_r2
+    overlap_real = torch.sum(real_part) * dV
+    overlap_imag = torch.sum(imag_part) * dV
+    return torch.sqrt(overlap_real**2 + overlap_imag**2)
+
+
+def pro_p_ene_plot(solver):
+
+    k = np.array([1.0, 0, 0.0]) # 初始动量
+    R0 = np.array([0.0, 0.0, 0.0]) # 起始坐标（起始位置放置中心0）
+    delta = np.array(0.5) # 波包宽度参数
+    rho_list, x_list, px_list, py_list, pz_list, energy_list, overlap_list = [], [], [], [], [], [], []
+
+    # 计算动量、能量损失
+    for arrays in solver.grid_generator(8):
+
+        xf, yf, zf, tf = solver.split_input_with_grad(arrays)
+
+        # 模型输出
+        psi_r, psi_i = solver.model(xf, yf, zf, tf)
+        psi_r2, psi_i2 = analytic_solution_cartesian(k, R0, arrays, delta)
+
+        # 归一化（可选）
+        psi_r1, psi_i1 = normalize_wavefunction(psi_r, psi_i, dV=1.0)
+        psi_r2, psi_i2 = normalize_wavefunction(psi_r2, psi_i2, dV=1.0)
+
+        # 计算交叠
+        overlap = overlap_integral(psi_r1, psi_i1, psi_r2, psi_i2, dV=1.0)
+
+        # 几率密度
+        rho = psi_r**2 + psi_i**2
+        rho_total = rho.mean()  # 或用 .sum() * dx*dy*dz
+
+        # 计算x期望 <x> = sum(x * rho) / sum(rho)
+        x_mean = torch.sum(xf * rho) / torch.sum(rho)
+
+        # 动量
+        grad_r = torch.autograd.grad(psi_r, [xf, yf, zf, tf], grad_outputs=torch.ones_like(psi_r), create_graph=True)
+        grad_i = torch.autograd.grad(psi_i, [xf, yf, zf, tf], grad_outputs=torch.ones_like(psi_i), create_graph=True)
+        psi_r_x, psi_r_y, psi_r_z, _ = grad_r
+        psi_i_x, psi_i_y, psi_i_z, _ = grad_i
+        px = torch.mean(psi_r * psi_i_x -
+                                psi_i * psi_r_x)
+        py = torch.mean(psi_r * psi_i_y -
+                                psi_i * psi_r_y)
+        pz = torch.mean(psi_r * psi_i_z -
+                                psi_i * psi_r_z)
+
+        # 能量
+        lap_r, lap_i, _, _ = solver.laplacian(arrays)
+        energy = torch.mean(psi_r * lap_r + psi_i * lap_i)
+
+        # 保存数据
+        rho_list.append(rho_total.item())
+        px_list.append(px.item())
+        py_list.append(py.item())
+        pz_list.append(pz.item())
+        energy_list.append(energy.item())
+        x_list.append(x_mean.item())
+        overlap_list.append(overlap.item())
+
+    # 绘图
+    plt.figure(figsize=(12, 4))
+    plt.subplot(1, 2, 1)
+    plt.plot(time_points.numpy(), rho_list)
+    plt.title("Probability vs Time")
+
+    plt.subplot(1, 2, 2)
+    plt.plot(time_points.numpy(), energy_list)
+    plt.title("Energy vs Time")
+    plt.tight_layout()
+    plt.tight_layout()
+    plt.show()
+
+    plt.figure(figsize=(8, 4))
+    plt.plot(time_points.numpy(), overlap_list)
+    plt.title("overlap vs Time")
+    plt.tight_layout()
+    plt.show()
+
+    plt.figure(figsize=(8, 4))
+    plt.plot(time_points.numpy(), x_list)
+    plt.title("x_expectation vs Time")
+    plt.tight_layout()
+    plt.show()
+
+    plt.figure(figsize=(15, 4))
+    plt.subplot(2, 3, 1)
+    plt.plot(time_points.numpy(), px_list)
+    plt.title("Momentum Px vs Time")
+
+    plt.subplot(2, 3, 2)
+    plt.plot(time_points.numpy(), py_list)
+    plt.title("Momentum Py vs Time")
+
+    plt.subplot(2, 3, 3)
+    plt.plot(time_points.numpy(), pz_list)
+    plt.title("Momentum Pz vs Time")
+    plt.tight_layout()
+    plt.show()
+
+
 # 主函数示例
 if __name__ == '__main__':
     B = 5.0 # 边界
@@ -699,7 +813,7 @@ if __name__ == '__main__':
     lb = np.array([-B, -B, -B, 0.0])
     # 定义所有训练点数据
     ub = np.array([B, B, B, t])
-    Nf = 30000
+    Nf = 10000
     X_f = lb + (ub - lb) * lhs(4, Nf)
     # 定义初始时刻数据
     ub0 = np.array([B, B, B, 0.1])
@@ -740,8 +854,8 @@ if __name__ == '__main__':
     y_flat = yy.reshape(-1, 1).float()
     z_flat = zz.reshape(-1, 1).float()
     # 学习率
-    lr = 1e-3
-    epochs = 1000
+    lr = 1e-10
+    epochs = 1
     # 网络配置
     layers = [4, 64, 64, 64, 64, 2]
     model = PINN3DSpherical(layers)
@@ -797,6 +911,8 @@ if __name__ == '__main__':
     predict_and_plot(solver, B, k, R0, delta)
     # 绘制 z=0全时空实部、虚部和振幅偏差
     calculate_and_plot_diffs(solver, B, k, R0, delta)
+    # 绘制几率、能量、动量随时间变化
+    pro_p_ene_plot(solver)
 
     # === 保存参数信息到 txt 文件 ===
     param_txt_path = save_path.replace('.pkl', '_params.txt')
