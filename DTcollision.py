@@ -42,7 +42,7 @@ class PINN3DSpherical(nn.Module):
 # 求解器
 class Solver3DSpherical:
     def __init__(self, model, B, t, Nf,
-                 X0, X_f, U2, V2,
+                 X_f, U2, V2,
                  x_flat, y_flat, z_flat, n_fft, time_points,
                  k, R0, delta,
                  lr_ic, lr_pde, lr_norm, lr_ana, lr_fft, lr_mom, lr_ene):
@@ -83,10 +83,10 @@ class Solver3DSpherical:
         # 原始大数量数组
         self.data = X_f
         # 初始时刻总采样点
-        self.X0 = X0
+        # self.X0 = X0
 
     # 其他时刻归一化数据集合
-    def grid_generator(self, n_per_dim):
+    def grid_generator(self, n_per_dim=8):
         t_values = np.linspace(0, self.t, 10)
         ub1 = np.array([self.B, self.B, self.B, 0.5])
         lb = np.array([-self.B, -self.B, -self.B, 0.0])
@@ -183,8 +183,9 @@ class Solver3DSpherical:
 
 
         # 计算动量、能量损失
-        for arrays in self.grid_generator(8):
+        for arrays in self.grid_generator():
             if arrays[0, 3] == 0:
+                self.X0 = arrays
                 psi_r0, psi_i0 = self.initial_wave_cartesian(arrays)
                 # 1. 初始能量
                 lap_r0, lap_i0 = self.laplacian_ini_psi(arrays)
@@ -592,7 +593,7 @@ def predict_and_plot(solver, B, k, R0, delta):
     z = 0
     y = 0
     # x = 0
-    t = 0.5
+    t = 0.0
     x = np.linspace(-10, 10, N)
     # x = np.full((1, N), x)
     y_test = np.full((1, N), y)
@@ -711,7 +712,7 @@ def pro_p_ene_plot(solver):
     rho_list, x_list, px_list, py_list, pz_list, energy_list, overlap_list = [], [], [], [], [], [], []
 
     # 计算动量、能量损失
-    for arrays in solver.grid_generator(8):
+    for arrays in solver.grid_generator():
 
         xf, yf, zf, tf = solver.split_input_with_grad(arrays)
 
@@ -813,13 +814,13 @@ if __name__ == '__main__':
     lb = np.array([-B, -B, -B, 0.0])
     # 定义所有训练点数据
     ub = np.array([B, B, B, t])
-    Nf = 10000
+    Nf = 40000
     X_f = lb + (ub - lb) * lhs(4, Nf)
     # 定义初始时刻数据
-    ub0 = np.array([B, B, B, 0.1])
-    N0 = 10000
-    X0 = lb + (ub0 - lb) * lhs(4, N0)
-    U0_ana, V0_ana = analytic_solution_cartesian(k, R0, X0, delta)
+    # ub0 = np.array([B, B, B, 0])
+    # N0 = 10000
+    # X0 = lb + (ub0 - lb) * lhs(4, N0)
+    # U0_ana, V0_ana = analytic_solution_cartesian(k, R0, X0, delta)
     # 定义解析解引导数据
     U2, V2 = analytic_solution_cartesian(k, R0, X_f, delta)
 
@@ -860,17 +861,17 @@ if __name__ == '__main__':
     layers = [4, 64, 64, 64, 64, 2]
     model = PINN3DSpherical(layers)
     solver = Solver3DSpherical(model, B, t, Nf,
-                               X0, X_f, U2, V2,
+                               X_f, U2, V2,
                                x_flat, y_flat, z_flat,  n_fft, time_points,
                                k, R0, delta,
                                lr_ic, lr_pde, lr_norm, lr_ana, lr_fft, lr_mom, lr_ene)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
     # 初始条件
-    ana_mean_density = solver.calculate_norm(U0_ana, V0_ana)
-    U0, V0 = solver.initial_wave_cartesian(X0)
-    mean_density = solver.calculate_norm(U0, V0)
-    print("ana_mean_density - mean_density =", ana_mean_density - mean_density) # 同一时刻下计算归一化值
+    # ana_mean_density = solver.calculate_norm(U0_ana, V0_ana)
+    # U0, V0 = solver.initial_wave_cartesian(X0)
+    # mean_density = solver.calculate_norm(U0, V0)
+    # print("ana_mean_density - mean_density =", ana_mean_density - mean_density) # 同一时刻下计算归一化值
 
     file_path = './save_model/model_epoch8000_9000_0711_1650.pkl' # 有这个文件则代表在此基础上训练
     start_epoch = 0
@@ -898,8 +899,8 @@ if __name__ == '__main__':
         'epoch': start_epoch + epochs,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
-        'mean_density': mean_density,
-        'X0': X0,
+        # 'mean_density': mean_density,
+        # 'X0': X0,
         'X_f': X_f,
         'final_loss': history,
     }, save_path)
@@ -948,7 +949,7 @@ if __name__ == '__main__':
         f.write(f"x_flat.shape: {x_flat.shape}\n")
         f.write("\n=== 其它参数 ===\n")
         # f.write(f"n_per_dim: {n_per_dim}\n")  # 每维取几个点（4维空间中每维取10个点 -> 共 10^4 = 10000 个点）
-        f.write(f"X0.shape: {X0.shape}\n")
+        # f.write(f"X0.shape: {X0.shape}\n")
         f.write(f"X_f.shape: {X_f.shape}\n")
         # f.write(f"解析解数组数量: {len(arrays)}\n")
 
