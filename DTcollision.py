@@ -85,6 +85,9 @@ class Solver3DSpherical:
         # 初始时刻总采样点
         # self.X0 = X0
 
+        # 门空参数
+        self.gamma = -0.5
+
     # 其他时刻归一化数据集合
     def grid_generator(self, n_per_dim=8):
         t_values = np.linspace(0, self.t, 10)
@@ -106,12 +109,12 @@ class Solver3DSpherical:
         self.u2 = U2_new
         self.v2 = V2_new
 
-    def schrodinger_residual(self, batch_data):
+    def schrodinger_residual(self, x, y, z, t):
         """
         计算直角坐标系下的薛定谔方程残差：
         i ∂ψ/∂t + ½ Δψ = 0
         """
-        lap_r, lap_i, psi_i_t, psi_r_t = self.laplacian(batch_data)
+        lap_r, lap_i, psi_i_t, psi_r_t = self.laplacian(x, y, z, t)
 
         # 实部残差： Re{iψ_t + ½Δψ} = ψ_i_t - ½Δψ_r
         # 虚部残差： Im{iψ_t + ½Δψ} = -ψ_r_t - ½Δψ_i
@@ -137,9 +140,9 @@ class Solver3DSpherical:
         t = data[:, 3:4].clone().detach().to(device).requires_grad_(True)
         return x, y, z, t
 
-    def laplacian(self, data):
+    def laplacian(self, x, y, z, t):
         """计算三维直角坐标下的拉普拉斯项及时间导数"""
-        x, y, z, t = self.split_input_with_grad(data)
+
         # print("x.requires_grad =", x.requires_grad)  # 应该为 True
 
         # 模型预测 ψ_r, ψ_i
@@ -174,6 +177,24 @@ class Solver3DSpherical:
 
         return lap_r, lap_i, psi_i_t, psi_r_t
 
+    # 时间门控函数
+    def causal_gate(self, t, alpha=5.0):
+        """
+        t: torch tensor of time values
+        gamma: gate center shift (scalar)
+        alpha: gate steepness
+        """
+        t_norm = t / self.t
+        return 0.5 * (1.0 - torch.tanh(alpha * (t_norm - self.gamma)))
+
+    def update_gamma(self, loss, eta=0.01, epsilon=10.0):
+        """
+        gamma: current gamma (float)
+        loss: current PDE causal loss (float)
+        """
+        loss_np = loss.detach().cpu().numpy()
+        return self.gamma + eta * np.exp(-epsilon * loss_np)
+
     def loss(self, batch_data):
         mse_energy = []
         mse_momentum_x = []
@@ -186,7 +207,10 @@ class Solver3DSpherical:
         for arrays in self.grid_generator():
             if arrays[0, 3] == 0:
                 self.X0 = arrays
+
                 psi_r0, psi_i0 = self.initial_wave_cartesian(arrays)
+                # 初始时刻密度
+                self.mean_density0 = self.calculate_norm(psi_r0, psi_i0)
                 # 1. 初始能量
                 lap_r0, lap_i0 = self.laplacian_ini_psi(arrays)
                 self.energy_r0 = torch.mean(psi_r0 * lap_r0 + psi_i0 * lap_i0)
@@ -205,9 +229,9 @@ class Solver3DSpherical:
                 x, y, z, t = self.split_input_with_grad(arrays)
                 psi_r, psi_i = self.model(x, y, z, t)
                 # energy
-                lap_r, lap_i, _, _ = self.laplacian(arrays)
+                lap_r, lap_i, _, _ = self.laplacian(x, y, z, t)
                 energy_r = torch.mean(psi_r * lap_r + psi_i * lap_i)
-                mse_energy.append((energy_r - self.energy_r0).pow(2))
+                mse_energy.append((energy_r - self.energy_r0).pow(2) * self.causal_gate(t))
 
                 # momentum
                 grad_r = torch.autograd.grad(psi_r, [x, y, z, t], grad_outputs=torch.ones_like(psi_r), create_graph=True)
@@ -220,15 +244,14 @@ class Solver3DSpherical:
                                         psi_i * psi_r_y)
                 momentum_z = torch.mean(psi_r * psi_i_z -
                                         psi_i * psi_r_z)
-                mse_momentum_x.append((momentum_x - self.momentum_x0).pow(2))
-                mse_momentum_y.append((momentum_y - self.momentum_y0).pow(2))
-                mse_momentum_z.append((momentum_z - self.momentum_z0).pow(2))
+                mse_momentum_x.append((momentum_x - self.momentum_x0).pow(2) * self.causal_gate(t))
+                mse_momentum_y.append((momentum_y - self.momentum_y0).pow(2) * self.causal_gate(t))
+                mse_momentum_z.append((momentum_z - self.momentum_z0).pow(2) * self.causal_gate(t))
 
                 # norm
-                mean_density = self.calculate_norm(psi_r, psi_i) # 其他时刻密度
-                u0, v0 = self.initial_wave_cartesian(self.X0)
-                mean_density0 = self.calculate_norm(u0, v0) # 初始时刻密度
-                mse_norm.append((mean_density - mean_density0).pow(2))
+                mean_density = (self.calculate_norm(psi_r, psi_i) - self.mean_density0) # 其他时刻密度
+
+                mse_norm.append(mean_density.pow(2) * self.causal_gate(t))
 
         mse_energy_total = torch.stack(mse_energy).mean()
         mse_momentum_x_total = torch.stack(mse_momentum_x).mean()
@@ -240,16 +263,17 @@ class Solver3DSpherical:
         x0, y0, z0, t0 = self.split_input_with_grad(self.X0)
         u0_pred, v0_pred = self.model(x0, y0, z0, t0)
         u0, v0 = self.initial_wave_cartesian(self.X0)
-        mse_ic = torch.mean((u0_pred - u0) ** 2) + torch.mean((v0_pred - v0) ** 2)
+        mse_ic = torch.mean((u0_pred - u0) ** 2 * self.causal_gate(t0)) + torch.mean((v0_pred - v0) ** 2 * self.causal_gate(t0))
 
         # 解析引导损失
         x2, y2, z2, t2 = self.split_input_with_grad(self.X2)
         u2_pred, v2_pred = self.model(x2, y2, z2, t2)
-        mse_ana = torch.mean((u2_pred - self.u2) ** 2) + torch.mean((v2_pred - self.v2) ** 2)
+        mse_ana = torch.mean((u2_pred - self.u2) ** 2 * self.causal_gate(t2)) + torch.mean((v2_pred - self.v2) ** 2 * self.causal_gate(t2))
 
         # PDE 残差
-        res_r, res_i = self.schrodinger_residual(batch_data)
-        mse_pde = torch.mean(res_r ** 2) + torch.mean(res_i ** 2)
+        x3, y3, z3, t3 = self.split_input_with_grad(batch_data)
+        res_r, res_i = self.schrodinger_residual(x3, y3, z3, t3)
+        mse_pde = torch.mean((res_r ** 2 + res_i ** 2) * self.causal_gate(t3))
 
         # FFT 损失
         mse_fft = 0.0
@@ -259,7 +283,7 @@ class Solver3DSpherical:
             psi_complex = (psi_r.squeeze(-1) + 1j * psi_i.squeeze(-1)).reshape(self.n_fft, self.n_fft, self.n_fft)
             fft_vals = torch.fft.fftn(psi_complex, dim=(0, 1, 2), norm='forward')
             const_mod = torch.abs(fft_vals[0, 0, 0])
-            mse_fft += const_mod.pow(2)
+            mse_fft += const_mod.pow(2) * self.causal_gate(t_val)
         mse_fft = mse_fft / len(self.time_points)
 
         # 权重加权总损失
@@ -275,6 +299,9 @@ class Solver3DSpherical:
 
         total_loss = (mse_ic + mse_pde + mse_norm_total + mse_ana +
                       mse_fft + mse_momentum_x_total + mse_momentum_y_total + mse_momentum_z_total + mse_energy_total)
+        print("gamma:", self.gamma)
+        self.gamma = self.update_gamma(total_loss)
+
 
         return (total_loss, mse_ic, mse_pde, mse_norm_total, mse_ana, mse_fft,
                 mse_momentum_x_total, mse_momentum_y_total, mse_momentum_z_total, mse_energy_total)
@@ -525,8 +552,8 @@ class Solver3DSpherical:
         X_r = lb + (ub - lb) * lhs(4, N_r)
 
         for _ in range(max_iterations):
-
-            res_r, res_i = self.schrodinger_residual(X_r)
+            x, y, z, t = self.split_input_with_grad(X_r)
+            res_r, res_i = self.schrodinger_residual(x, y, z, t)
             residual = torch.sqrt(res_r ** 2 + res_i ** 2).detach().cpu().numpy().flatten()
 
             tau = np.mean(residual)
@@ -710,7 +737,7 @@ def pro_p_ene_plot(solver, k, R0, delta, m):
     # R0 = np.array([0.0, 0.0, 0.0]) # 起始坐标（起始位置放置中心0）
     # delta = np.array(0.5) # 波包宽度参数
     rho_list, x_list, px_list, py_list, pz_list, energy_list, overlap_list = [], [], [], [], [], [], []
-    time_points, T_list = [], []
+    time_points, kinetic_list = [], []
 
     # 计算动量、能量损失
     for arrays in solver.grid_generator():
@@ -750,11 +777,11 @@ def pro_p_ene_plot(solver, k, R0, delta, m):
                                 psi_i * psi_r_z)
 
         # 动能 = (px^2 + py^2 + pz^2) / 2m
-        T = (px ** 2 + py ** 2 + pz ** 2) / (2 * m)
+        kinetic = (px ** 2 + py ** 2 + pz ** 2) / (2 * m)
         # T = torch.tensor(T, dtype=torch.float32, device=device)
 
         # 能量
-        lap_r, lap_i, _, _ = solver.laplacian(arrays)
+        lap_r, lap_i, _, _ = solver.laplacian(xf, yf, zf, tf)
         energy = -1 /(2*m) * torch.mean(psi_r * lap_r + psi_i * lap_i)
         # energy = torch.tensor(energy, dtype=torch.float32, device=device)
 
@@ -764,7 +791,7 @@ def pro_p_ene_plot(solver, k, R0, delta, m):
         py_list.append(py.item())
         pz_list.append(pz.item())
         energy_list.append(energy.item())
-        T_list.append(T.item())
+        kinetic_list.append(kinetic.item())
         x_list.append(x_mean.item())
         overlap_list.append(overlap.item())
 
@@ -789,7 +816,7 @@ def pro_p_ene_plot(solver, k, R0, delta, m):
     plt.show()
 
     plt.figure(figsize=(8, 4))
-    plt.plot(time_points, percent_change(T_list))
+    plt.plot(time_points, percent_change(kinetic_list))
     plt.title("T (% Change) vs Time")
     plt.ylabel("% Change")
     plt.tight_layout()
