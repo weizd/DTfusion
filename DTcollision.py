@@ -704,17 +704,20 @@ def overlap_integral(psi_r1, psi_i1, psi_r2, psi_i2, dV=1.0):
     return torch.sqrt(overlap_real**2 + overlap_imag**2)
 
 
-def pro_p_ene_plot(solver):
+def pro_p_ene_plot(solver, k, R0, delta, m):
 
-    k = np.array([1.0, 0, 0.0]) # 初始动量
-    R0 = np.array([0.0, 0.0, 0.0]) # 起始坐标（起始位置放置中心0）
-    delta = np.array(0.5) # 波包宽度参数
+    # k = np.array([1.0, 0, 0.0]) # 初始动量
+    # R0 = np.array([0.0, 0.0, 0.0]) # 起始坐标（起始位置放置中心0）
+    # delta = np.array(0.5) # 波包宽度参数
     rho_list, x_list, px_list, py_list, pz_list, energy_list, overlap_list = [], [], [], [], [], [], []
+    time_points, T_list = [], []
 
     # 计算动量、能量损失
     for arrays in solver.grid_generator():
 
         xf, yf, zf, tf = solver.split_input_with_grad(arrays)
+        t = tf[0].item()  # 获取当前时间点
+        time_points.append(t)
 
         # 模型输出
         psi_r, psi_i = solver.model(xf, yf, zf, tf)
@@ -746,9 +749,14 @@ def pro_p_ene_plot(solver):
         pz = torch.mean(psi_r * psi_i_z -
                                 psi_i * psi_r_z)
 
+        # 动能 = (px^2 + py^2 + pz^2) / 2m
+        T = (px ** 2 + py ** 2 + pz ** 2) / (2 * m)
+        # T = torch.tensor(T, dtype=torch.float32, device=device)
+
         # 能量
         lap_r, lap_i, _, _ = solver.laplacian(arrays)
-        energy = torch.mean(psi_r * lap_r + psi_i * lap_i)
+        energy = -1 /(2*m) * torch.mean(psi_r * lap_r + psi_i * lap_i)
+        # energy = torch.tensor(energy, dtype=torch.float32, device=device)
 
         # 保存数据
         rho_list.append(rho_total.item())
@@ -756,46 +764,61 @@ def pro_p_ene_plot(solver):
         py_list.append(py.item())
         pz_list.append(pz.item())
         energy_list.append(energy.item())
+        T_list.append(T.item())
         x_list.append(x_mean.item())
         overlap_list.append(overlap.item())
 
-    # 绘图
+    # 转为 numpy 数组
+    time_points = np.array(time_points)
+    def percent_change(lst):
+        lst = np.array(lst)
+        return (lst - lst[0]) / abs(lst[0]) * 100
+
+    # 绘图：百分比变化
     plt.figure(figsize=(12, 4))
     plt.subplot(1, 2, 1)
-    plt.plot(time_points.numpy(), rho_list)
-    plt.title("Probability vs Time")
+    plt.plot(time_points, percent_change(rho_list))
+    plt.title("Probability (% Change) vs Time")
+    plt.ylabel("% Change")
 
     plt.subplot(1, 2, 2)
-    plt.plot(time_points.numpy(), energy_list)
-    plt.title("Energy vs Time")
-    plt.tight_layout()
+    plt.plot(time_points, percent_change(energy_list))
+    plt.title("Energy (% Change) vs Time")
+    plt.ylabel("% Change")
     plt.tight_layout()
     plt.show()
 
     plt.figure(figsize=(8, 4))
-    plt.plot(time_points.numpy(), overlap_list)
+    plt.plot(time_points, percent_change(T_list))
+    plt.title("T (% Change) vs Time")
+    plt.ylabel("% Change")
+    plt.tight_layout()
+    plt.show()
+
+    plt.figure(figsize=(8, 4))
+    plt.plot(time_points, overlap_list)
     plt.title("overlap vs Time")
     plt.tight_layout()
     plt.show()
 
     plt.figure(figsize=(8, 4))
-    plt.plot(time_points.numpy(), x_list)
+    plt.plot(time_points, x_list)
     plt.title("x_expectation vs Time")
     plt.tight_layout()
     plt.show()
 
     plt.figure(figsize=(15, 4))
     plt.subplot(2, 3, 1)
-    plt.plot(time_points.numpy(), px_list)
-    plt.title("Momentum Px vs Time")
+    plt.plot(time_points, percent_change(px_list))
+    plt.title("Momentum Px (% Change)")
 
     plt.subplot(2, 3, 2)
-    plt.plot(time_points.numpy(), py_list)
-    plt.title("Momentum Py vs Time")
+    plt.plot(time_points, percent_change(py_list))
+    plt.title("Momentum Py (% Change)")
 
     plt.subplot(2, 3, 3)
-    plt.plot(time_points.numpy(), pz_list)
-    plt.title("Momentum Pz vs Time")
+    plt.plot(time_points, percent_change(pz_list))
+    plt.title("Momentum Pz (% Change)")
     plt.tight_layout()
     plt.show()
 
@@ -889,7 +912,7 @@ if __name__ == '__main__':
         print(f"Loaded model weights from {file_path}")
 
     # 训练模型
-    history = solver.train(epochs=epochs, initial_batch_size=3000, optimizer=optimizer, resample_every=100)
+    history = solver.train(epochs=epochs, initial_batch_size=3000, optimizer=optimizer, resample_every=10)
 
     # 保存模型到一个带时间戳的文件中
     now = datetime.now().strftime('%m%d_%H%M')
@@ -913,7 +936,7 @@ if __name__ == '__main__':
     # 绘制 z=0全时空实部、虚部和振幅偏差
     calculate_and_plot_diffs(solver, B, k, R0, delta)
     # 绘制几率、能量、动量随时间变化
-    pro_p_ene_plot(solver)
+    pro_p_ene_plot(solver, k, R0, delta, m)
 
     # === 保存参数信息到 txt 文件 ===
     param_txt_path = save_path.replace('.pkl', '_params.txt')
