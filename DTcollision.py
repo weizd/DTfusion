@@ -628,11 +628,13 @@ def predict_and_plot(solver, B, k, R0, delta, save_dir):
     psi_exact_real =psi_exact_real.cpu().detach().numpy()
     psi_exact_imag = psi_exact_imag.cpu().detach().numpy()
     # PINN 预测
-    xf = torch.tensor(x_y_z_test[:,0:1], dtype=torch.float32, device=device)
-    yf = torch.tensor(x_y_z_test[:,1:2], dtype=torch.float32, device=device)
-    zf = torch.tensor(x_y_z_test[:,2:3], dtype=torch.float32, device=device)
-    tf = torch.tensor(x_y_z_test[:,3:4], dtype=torch.float32, device=device)
-    psi_pinn_real, psi_pinn_imag = solver.model(xf, yf, zf, tf)
+    solver.model.eval()  # 设置为评估模式
+    with torch.no_grad():
+        xf = torch.tensor(x_y_z_test[:,0:1], dtype=torch.float32, device=device)
+        yf = torch.tensor(x_y_z_test[:,1:2], dtype=torch.float32, device=device)
+        zf = torch.tensor(x_y_z_test[:,2:3], dtype=torch.float32, device=device)
+        tf = torch.tensor(x_y_z_test[:,3:4], dtype=torch.float32, device=device)
+        psi_pinn_real, psi_pinn_imag = solver.model(xf, yf, zf, tf)
     psi_pinn_real =psi_pinn_real.cpu().detach().numpy()
     psi_pinn_imag = psi_pinn_imag.cpu().detach().numpy()
     # 绘图对比
@@ -669,11 +671,14 @@ def calculate_and_plot_diffs(solver, B, k, R0, delta, save_dir):
     for t in t_values:
         t_test = np.full((1, N), t)
         x_y_z_test_all = np.vstack([x, y, z, t_test]).T
-        xf = torch.tensor(x_y_z_test_all[:, 0:1], dtype=torch.float32, device=device)
-        yf = torch.tensor(x_y_z_test_all[:, 1:2], dtype=torch.float32, device=device)
-        zf = torch.tensor(x_y_z_test_all[:, 2:3], dtype=torch.float32, device=device)
-        tf = torch.tensor(x_y_z_test_all[:, 3:4], dtype=torch.float32, device=device)
-        psi_pinn_real, psi_pinn_imag = solver.model(xf, yf, zf, tf)
+        # PINN 预测
+        solver.model.eval()  # 设置为评估模式
+        with torch.no_grad():
+            xf = torch.tensor(x_y_z_test_all[:, 0:1], dtype=torch.float32, device=device)
+            yf = torch.tensor(x_y_z_test_all[:, 1:2], dtype=torch.float32, device=device)
+            zf = torch.tensor(x_y_z_test_all[:, 2:3], dtype=torch.float32, device=device)
+            tf = torch.tensor(x_y_z_test_all[:, 3:4], dtype=torch.float32, device=device)
+            psi_pinn_real, psi_pinn_imag = solver.model(xf, yf, zf, tf)
         psi_pinn_real = psi_pinn_real.cpu().detach().numpy()
         psi_pinn_imag = psi_pinn_imag.cpu().detach().numpy()
 
@@ -735,11 +740,16 @@ def pro_p_ene_plot(solver, k, R0, delta, m, save_dir):
 
     # 计算动量、能量损失
     for arrays in solver.grid_generator():
-
+        # PINN 预测
+        # solver.model.eval()  # 设置为评估模式
+        # with torch.no_grad():
+        #     xf = torch.tensor(arrays[:, 0:1], dtype=torch.float32, device=device)
+        #     yf = torch.tensor(arrays[:, 1:2], dtype=torch.float32, device=device)
+        #     zf = torch.tensor(arrays[:, 2:3], dtype=torch.float32, device=device)
+        #     tf = torch.tensor(arrays[:, 3:4], dtype=torch.float32, device=device)
         xf, yf, zf, tf = solver.split_input_with_grad(arrays)
         t = tf[0].item()  # 获取当前时间点
         time_points.append(t)
-
         # 模型输出
         psi_r, psi_i = solver.model(xf, yf, zf, tf)
         psi_r2, psi_i2 = analytic_solution_cartesian(k, R0, arrays, delta)
