@@ -82,8 +82,6 @@ class Solver3DSpherical:
         self.v2 = V2
         # 原始大数量数组
         self.data = X_f
-        # 初始时刻总采样点
-        # self.X0 = X0
 
         # 门空参数
         self.gamma = -0.5
@@ -299,17 +297,16 @@ class Solver3DSpherical:
 
         total_loss = (mse_ic + mse_pde + mse_norm_total + mse_ana +
                       mse_fft + mse_momentum_x_total + mse_momentum_y_total + mse_momentum_z_total + mse_energy_total)
-        print("gamma:", self.gamma)
+        # print("gamma:", self.gamma)
         self.gamma = self.update_gamma(total_loss)
-
 
         return (total_loss, mse_ic, mse_pde, mse_norm_total, mse_ana, mse_fft,
                 mse_momentum_x_total, mse_momentum_y_total, mse_momentum_z_total, mse_energy_total)
 
-    def train(self, epochs, initial_batch_size, optimizer, resample_every):
+    def train(self, epochs, initial_batch_size, optimizer, resample_every, save_path):
         scheduler = ReduceLROnPlateau(optimizer, factor=0.5, patience=100)
         history = {'loss': [], 'ic': [], 'pde': [], 'norm': [], 'ana': [], 'fft': [], 'mom_x': [], 'mom_y': [], 'mom_z': [], 'ene': []}
-        save_path = r'./save_model/training_loss.png'
+        # save_path = r'./save_model/training_loss.png'
         start = time()
 
         # ========== 实时绘图设置 ==========
@@ -391,12 +388,13 @@ class Solver3DSpherical:
             if ep % 1 == 0:
                 print(
                     f"Epoch {ep}/{epochs}, Batch Size: {current_batch_size}, Loss: {total_loss.item():.4e}, IC: {total_ic.item():.4e}, "
-                    f"PDE: {total_pde.item():.4e},"
+                    f"PDE: {total_pde.item():.4e}, "
                     # f" norm: {total_norm.item():.4e}, ana: {total_ana.item():.4e}, fft: {total_fft.item():.4e}, "
-                    f"mom_x: {total_mom_x.item():.4e}, mom_y: {total_mom_y.item():.4e}, mom_z: {total_mom_z.item():.4e}, ene: {total_ene.item():.4e}")
+                    f"mom_x: {total_mom_x.item():.4e}, mom_y: {total_mom_y.item():.4e}, mom_z: {total_mom_z.item():.4e}, ene: {total_ene.item():.4e}, "
+                    f"gamma: {self.gamma:.4e}")
 
         plt.ioff()
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.savefig(os.path.join(save_path, 'loss.png'))
         plt.close(fig)
         print(f"Training completed in {time() - start:.1f}s")
         return history
@@ -474,11 +472,8 @@ class Solver3DSpherical:
         # 复系数项
         real_part = r_r0_sq - 6 * delta2 - 4 * delta4 * (kx ** 2 + ky ** 2 + kz ** 2)
         imag_part = -4 * delta2 * (kx * dx + ky * dy + kz * dz)
-
         coeff = real_part + 1j * imag_part  # complex
-
         psi_lap = exp_arg * coeff / norm  # complex
-
         # 分离实部和虚部
         return torch.real(psi_lap), torch.imag(psi_lap)
 
@@ -615,7 +610,7 @@ def analytic_solution_cartesian(K, R, X, delta, m=1.0):
 
 
 # 测试点 y=0; z=0; t=0.5截面
-def predict_and_plot(solver, B, k, R0, delta):
+def predict_and_plot(solver, B, k, R0, delta, save_dir):
     N = 100
     z = 0
     y = 0
@@ -651,10 +646,13 @@ def predict_and_plot(solver, B, k, R0, delta):
     plt.title(f'Wavefunction slice at y={y}, z={z}, t={t}')
     plt.legend()
     plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, f'predict_plot.png'))
     plt.show()
 
+
+
 # 绘制 y=0; z=0 全时空实部、虚部和振幅偏差
-def calculate_and_plot_diffs(solver, B, k, R0, delta):
+def calculate_and_plot_diffs(solver, B, k, R0, delta, save_dir):
     # 定义时间范围
     t_values = np.linspace(0, 1, 100)
     N = 100
@@ -713,13 +711,13 @@ def calculate_and_plot_diffs(solver, B, k, R0, delta):
         ax.set_ylabel('x')
         ax.set_title(labels[i])
         plt.colorbar(im, ax=ax)
-
+    plt.savefig(os.path.join(save_dir, f'calculate_and_plot_diffs.png'))
     plt.show()
+
 
 
 def normalize_wavefunction(psi_r, psi_i, dV=1.0):
     rho = psi_r**2 + psi_i**2
-    # rho = torch.tensor(rho, dtype=torch.float32, device=device)
     norm = torch.sqrt(torch.sum(rho) * dV)
     return psi_r / norm, psi_i / norm
 
@@ -731,11 +729,7 @@ def overlap_integral(psi_r1, psi_i1, psi_r2, psi_i2, dV=1.0):
     return torch.sqrt(overlap_real**2 + overlap_imag**2)
 
 
-def pro_p_ene_plot(solver, k, R0, delta, m):
-
-    # k = np.array([1.0, 0, 0.0]) # 初始动量
-    # R0 = np.array([0.0, 0.0, 0.0]) # 起始坐标（起始位置放置中心0）
-    # delta = np.array(0.5) # 波包宽度参数
+def pro_p_ene_plot(solver, k, R0, delta, m, save_dir):
     rho_list, x_list, px_list, py_list, pz_list, energy_list, overlap_list = [], [], [], [], [], [], []
     time_points, kinetic_list = [], []
 
@@ -778,7 +772,6 @@ def pro_p_ene_plot(solver, k, R0, delta, m):
 
         # 动能 = (px^2 + py^2 + pz^2) / 2m
         kinetic = (px ** 2 + py ** 2 + pz ** 2) / (2 * m)
-        # T = torch.tensor(T, dtype=torch.float32, device=device)
 
         # 能量
         lap_r, lap_i, _, _ = solver.laplacian(xf, yf, zf, tf)
@@ -813,26 +806,34 @@ def pro_p_ene_plot(solver, k, R0, delta, m):
     plt.title("Energy (% Change) vs Time")
     plt.ylabel("% Change")
     plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, f'Probability_Energy.png'))
     plt.show()
+
 
     plt.figure(figsize=(8, 4))
     plt.plot(time_points, percent_change(kinetic_list))
     plt.title("T (% Change) vs Time")
     plt.ylabel("% Change")
     plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, f'Probability_Energy.png'))
     plt.show()
+
 
     plt.figure(figsize=(8, 4))
     plt.plot(time_points, overlap_list)
     plt.title("overlap vs Time")
     plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, f'overlap.png'))
     plt.show()
+
 
     plt.figure(figsize=(8, 4))
     plt.plot(time_points, x_list)
     plt.title("x_expectation vs Time")
     plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, f'x_expectation.png'))
     plt.show()
+
 
     plt.figure(figsize=(15, 4))
     plt.subplot(2, 3, 1)
@@ -847,7 +848,9 @@ def pro_p_ene_plot(solver, k, R0, delta, m):
     plt.plot(time_points, percent_change(pz_list))
     plt.title("Momentum Pz (% Change)")
     plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, f'Momentum.png'))
     plt.show()
+
 
 
 # 主函数示例
@@ -860,17 +863,11 @@ if __name__ == '__main__':
     delta = np.array(0.5) # 波包宽度参数
     m = np.array(1.0) # 质量
 
-
     lb = np.array([-B, -B, -B, 0.0])
     # 定义所有训练点数据
     ub = np.array([B, B, B, t])
-    Nf = 40000
+    Nf = 3000
     X_f = lb + (ub - lb) * lhs(4, Nf)
-    # 定义初始时刻数据
-    # ub0 = np.array([B, B, B, 0])
-    # N0 = 10000
-    # X0 = lb + (ub0 - lb) * lhs(4, N0)
-    # U0_ana, V0_ana = analytic_solution_cartesian(k, R0, X0, delta)
     # 定义解析解引导数据
     U2, V2 = analytic_solution_cartesian(k, R0, X_f, delta)
 
@@ -905,8 +902,8 @@ if __name__ == '__main__':
     y_flat = yy.reshape(-1, 1).float()
     z_flat = zz.reshape(-1, 1).float()
     # 学习率
-    lr = 1e-10
-    epochs = 1
+    lr = 1e-3
+    epochs = 10
     # 网络配置
     layers = [4, 64, 64, 64, 64, 2]
     model = PINN3DSpherical(layers)
@@ -917,61 +914,53 @@ if __name__ == '__main__':
                                lr_ic, lr_pde, lr_norm, lr_ana, lr_fft, lr_mom, lr_ene)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
-    # 初始条件
-    # ana_mean_density = solver.calculate_norm(U0_ana, V0_ana)
-    # U0, V0 = solver.initial_wave_cartesian(X0)
-    # mean_density = solver.calculate_norm(U0, V0)
-    # print("ana_mean_density - mean_density =", ana_mean_density - mean_density) # 同一时刻下计算归一化值
 
-    file_path = './save_model/model_epoch8000_9000_0711_1650.pkl' # 有这个文件则代表在此基础上训练
+    # === 时间戳文件夹 ===
+    now = datetime.now().strftime('%m%d_%H%M')  # 如 0717_1530
+    save_dir = f'./save_model/{now}'
+    os.makedirs(save_dir, exist_ok=True)
+
+    model_file = os.path.join(save_dir, 'model.pkl')  # 模型文件路径
+    param_txt_path = os.path.join(save_dir, 'params.txt')  # 参数记录文件路径
+
+    # 如果已有模型，加载
     start_epoch = 0
-    if os.path.exists(file_path):
-        checkpoint = torch.load(file_path)
+    if os.path.exists(model_file):
+        checkpoint = torch.load(model_file)
         model.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
 
-        # 覆盖旧学习率
+        # 更新学习率
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
 
-        mean_density = checkpoint['mean_density']
         start_epoch = checkpoint.get('epoch', 0)
-        print(f"Loaded model weights from {file_path}")
+        print(f"Loaded model weights from {model_file}")
 
     # 训练模型
-    history = solver.train(epochs=epochs, initial_batch_size=3000, optimizer=optimizer, resample_every=10)
-
-    # 保存模型到一个带时间戳的文件中
-    now = datetime.now().strftime('%m%d_%H%M')
-    save_path = f'./save_model/model_epoch{start_epoch}_{start_epoch+epochs}_{now}.pkl'
+    history = solver.train(epochs=epochs, initial_batch_size=3000, optimizer=optimizer, resample_every=10, save_path=save_dir)
 
     torch.save({
         'epoch': start_epoch + epochs,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
-        # 'mean_density': mean_density,
-        # 'X0': X0,
-        'X_f': X_f,
         'final_loss': history,
-    }, save_path)
-
-    print(f"Model saved to: {save_path}")
+    }, model_file)
+    print(f"Model saved to: {model_file}")
 
 
     # 测试点 只看 z=0; t=0.5截面
-    predict_and_plot(solver, B, k, R0, delta)
+    predict_and_plot(solver, B, k, R0, delta, save_dir)
     # 绘制 z=0全时空实部、虚部和振幅偏差
-    calculate_and_plot_diffs(solver, B, k, R0, delta)
+    calculate_and_plot_diffs(solver, B, k, R0, delta, save_dir)
     # 绘制几率、能量、动量随时间变化
-    pro_p_ene_plot(solver, k, R0, delta, m)
+    pro_p_ene_plot(solver, k, R0, delta, m, save_dir)
 
     # === 保存参数信息到 txt 文件 ===
-    param_txt_path = save_path.replace('.pkl', '_params.txt')
-
     with open(param_txt_path, 'w') as f:
         f.write("=== 模型训练参数记录 ===\n")
         f.write(f"模型保存时间：{now}\n")
-        f.write(f"模型路径：{save_path}\n")
+        f.write(f"模型路径：{save_dir}\n")
         f.write(f"初始 epoch：{start_epoch}\n")
         f.write(f"总训练 epoch：{epochs}\n")
         f.write(f"最终 epoch：{start_epoch + epochs}\n")
