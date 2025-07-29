@@ -741,7 +741,7 @@ def pro_p_ene_plot(solver, k, R0, delta, m, save_dir):
     # 计算动量、能量损失
     for arrays in solver.grid_generator():
         # PINN 预测
-        # solver.model.eval()  # 设置为评估模式
+        solver.model.eval()  # 设置为评估模式
         # with torch.no_grad():
         #     xf = torch.tensor(arrays[:, 0:1], dtype=torch.float32, device=device)
         #     yf = torch.tensor(arrays[:, 1:2], dtype=torch.float32, device=device)
@@ -930,7 +930,8 @@ if __name__ == '__main__':
     save_dir = f'./save_model/{now}'
     os.makedirs(save_dir, exist_ok=True)
 
-    model_file = os.path.join(save_dir, 'model.pkl')  # 模型文件路径
+    # model_file = os.path.join(save_dir, 'model.pkl')  # 模型文件路径
+    model_file = f'./save_model/0728_1436/model.pkl'
     param_txt_path = os.path.join(save_dir, 'params.txt')  # 参数记录文件路径
 
     # 如果已有模型，加载
@@ -947,16 +948,24 @@ if __name__ == '__main__':
         start_epoch = checkpoint.get('epoch', 0)
         print(f"Loaded model weights from {model_file}")
 
-    # 训练模型
-    history = solver.train(epochs=epochs, initial_batch_size=3000, optimizer=optimizer, resample_every=10, save_path=save_dir)
+    train_flag = False  # 或通过命令行传入参数
 
-    torch.save({
-        'epoch': start_epoch + epochs,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'final_loss': history,
-    }, model_file)
-    print(f"Model saved to: {model_file}")
+    if train_flag:
+
+        # 训练模型
+        history = solver.train(epochs=epochs, initial_batch_size=3000, optimizer=optimizer, resample_every=10,
+                               save_path=save_dir)
+
+        torch.save({
+            'epoch': start_epoch + epochs,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'final_loss': history,
+        }, model_file)
+        print(f"Model saved to: {model_file}")
+    else:
+        solver.model.eval()
+
 
 
     # 测试点 只看 z=0; t=0.5截面
@@ -998,9 +1007,7 @@ if __name__ == '__main__':
         f.write(f"x_flat.shape: {x_flat.shape}\n")
         f.write("\n=== 其它参数 ===\n")
         # f.write(f"n_per_dim: {n_per_dim}\n")  # 每维取几个点（4维空间中每维取10个点 -> 共 10^4 = 10000 个点）
-        # f.write(f"X0.shape: {X0.shape}\n")
         f.write(f"X_f.shape: {X_f.shape}\n")
-        # f.write(f"解析解数组数量: {len(arrays)}\n")
 
     print(f"参数信息保存到: {param_txt_path}")
 
