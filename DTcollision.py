@@ -2,6 +2,7 @@ import os
 import numpy as np
 import torch
 from torch import nn
+from torch.utils.data import DataLoader, TensorDataset
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
@@ -11,6 +12,7 @@ from pyDOE import lhs
 
 # 设置设备
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
+device1= 'cpu'
 print("device:", device)
 
 
@@ -43,7 +45,7 @@ class PINN3DSpherical(nn.Module):
 class Solver3DSpherical:
     def __init__(self, model, B, t, Nf,
                  X_f, U2, V2,
-                 x_flat, y_flat, z_flat, n_fft, time_points,
+                 # x_flat, y_flat, z_flat, n_fft, time_points,
                  k, R0, delta,
                  lr_ic, lr_pde, lr_norm, lr_ana, lr_fft, lr_mom, lr_ene):
 
@@ -62,11 +64,11 @@ class Solver3DSpherical:
         self.lr_ene = lr_ene
 
         # 构建一次性空间网格 (n_fft³)
-        self.n_fft = n_fft
-        self.time_points = time_points
-        self.x_flat = x_flat
-        self.y_flat = y_flat
-        self.z_flat = z_flat
+        # self.n_fft = n_fft
+        # self.time_points = time_points
+        # self.x_flat = x_flat
+        # self.y_flat = y_flat
+        # self.z_flat = z_flat
 
         # 模型
         self.model = model.to(device)
@@ -202,7 +204,7 @@ class Solver3DSpherical:
 
 
         # 计算动量、能量损失
-        for arrays in self.grid_generator():
+        for arrays in self.grid_generator():  # 严格均匀取点
             if arrays[0, 3] == 0:
                 self.X0 = arrays
 
@@ -274,22 +276,23 @@ class Solver3DSpherical:
         mse_pde = torch.mean((res_r ** 2 + res_i ** 2) * self.causal_gate(t3))
 
         # FFT 损失
-        mse_fft = 0.0
-        for t_val in self.time_points:
-            t_flat = t_val.repeat(self.x_flat.shape[0], 1)
-            psi_r, psi_i = self.model(self.x_flat, self.y_flat, self.z_flat, t_flat)
-            psi_complex = (psi_r.squeeze(-1) + 1j * psi_i.squeeze(-1)).reshape(self.n_fft, self.n_fft, self.n_fft)
-            fft_vals = torch.fft.fftn(psi_complex, dim=(0, 1, 2), norm='forward')
-            const_mod = torch.abs(fft_vals[0, 0, 0])
-            mse_fft += const_mod.pow(2) * self.causal_gate(t_val)
-        mse_fft = mse_fft / len(self.time_points)
+        # mse_fft = 0.0
+        # for t_val in self.time_points:
+        #     t_flat = t_val.repeat(self.x_flat.shape[0], 1)
+        #     psi_r, psi_i = self.model(self.x_flat, self.y_flat, self.z_flat, t_flat)
+        #     psi_complex = (psi_r.squeeze(-1) + 1j * psi_i.squeeze(-1)).reshape(self.n_fft, self.n_fft, self.n_fft)
+        #     fft_vals = torch.fft.fftn(psi_complex, dim=(0, 1, 2), norm='forward')
+        #     const_mod = torch.abs(fft_vals[0, 0, 0])
+        #     mse_fft += const_mod.pow(2) * self.causal_gate(t_val)
+        # mse_fft = mse_fft / len(self.time_points)
 
         # 权重加权总损失
         mse_ic = mse_ic * self.lr_ic
         mse_pde = mse_pde * self.lr_pde
         mse_norm_total = mse_norm_total * self.lr_norm
         mse_ana = mse_ana * self.lr_ana
-        mse_fft = mse_fft * self.lr_fft
+        # mse_fft = mse_fft * self.lr_fft
+        mse_fft = torch.tensor(0.0, device=device)
         mse_momentum_x_total = mse_momentum_x_total * self.lr_x_mom
         mse_momentum_y_total = mse_momentum_y_total * self.lr_y_mom
         mse_momentum_z_total = mse_momentum_z_total * self.lr_z_mom
@@ -306,7 +309,6 @@ class Solver3DSpherical:
     def train(self, epochs, initial_batch_size, optimizer, resample_every, save_path):
         scheduler = ReduceLROnPlateau(optimizer, factor=0.5, patience=100)
         history = {'loss': [], 'ic': [], 'pde': [], 'norm': [], 'ana': [], 'fft': [], 'mom_x': [], 'mom_y': [], 'mom_z': [], 'ene': []}
-        # save_path = r'./save_model/training_loss.png'
         start = time()
 
         # ========== 实时绘图设置 ==========
@@ -326,12 +328,12 @@ class Solver3DSpherical:
         ax.legend()
         ax.grid(True, which='both', linestyle='--', linewidth=0.5)
 
-        # 定义 batch_size 调整计划
-        batch_size_schedule = {
-            0: initial_batch_size,
-            5000000: initial_batch_size // 2,
-            10000000: initial_batch_size // 4,
-        }
+        # # 定义 batch_size 调整计划
+        # batch_size_schedule = {
+        #     0: initial_batch_size,
+        #     5000000: initial_batch_size // 2,
+        #     10000000: initial_batch_size // 4,
+        # }
 
         for ep in range(1, epochs + 1):
 
@@ -342,40 +344,47 @@ class Solver3DSpherical:
                 U2_new, V2_new = analytic_solution_cartesian(self.k, self.R0, X_f_new, self.delta)
                 self.update_residual_points(X_f_new, U2_new, V2_new)
 
-            # 动态 batch_size 调整
-            current_batch_size = max([v for k, v in batch_size_schedule.items() if ep >= k])
+            # 重建 DataLoader
+            full_dataset = TensorDataset(torch.tensor(self.data, dtype=torch.float32))
+            data_loader = DataLoader(full_dataset, batch_size=initial_batch_size, shuffle=True)
 
-            # 随机打乱数据
-            num_batches = len(self.data) // current_batch_size
-            batch_indices = np.arange(len(self.data))
-            np.random.shuffle(batch_indices)
-
-            for batch_idx in range(num_batches):
-                start_idx = batch_idx * current_batch_size
-                end_idx = (batch_idx + 1) * current_batch_size
-                batch_data = self.data[batch_indices[start_idx:end_idx]]
+            for batch in data_loader:
+                batch_data = batch[0].cpu().numpy()  # 若 loss 仍用 numpy 接口
                 optimizer.zero_grad()
                 loss, ic, pde, norm, ana, fft, mom_x, mom_y, mom_z, ene = self.loss(batch_data)
-                loss.backward(retain_graph=True)
+                loss.backward()
                 optimizer.step()
 
-            # 每个 epoch 结束后评估一次总损失
-            (total_loss, total_ic, total_pde, total_norm, total_ana, total_fft,
-             total_mom_x, total_mom_y, total_mom_z, total_ene) = self.loss(
-                self.data)
-            scheduler.step(total_loss)
+            # # 动态 batch_size 调整
+            # current_batch_size = max([v for k, v in batch_size_schedule.items() if ep >= k])
+            #
+            # # 随机打乱数据
+            # num_batches = len(self.data) // current_batch_size
+            # batch_indices = np.arange(len(self.data))
+            # np.random.shuffle(batch_indices)
+            #
+            # for batch_idx in range(num_batches):
+            #     start_idx = batch_idx * current_batch_size
+            #     end_idx = (batch_idx + 1) * current_batch_size
+            #     batch_data = self.data[batch_indices[start_idx:end_idx]]
+            #     optimizer.zero_grad()
+            #     loss, ic, pde, norm, ana, fft, mom_x, mom_y, mom_z, ene = self.loss(batch_data)
+            #     loss.backward(retain_graph=False)
+            #     optimizer.step()
+
+            scheduler.step(loss.item())
 
             # 记录历史
-            history['loss'].append(total_loss.item())
-            history['ic'].append(total_ic.item())
-            history['pde'].append(total_pde.item())
-            history['norm'].append(total_norm.item())
-            history['ana'].append(total_ana.item())
-            history['fft'].append(total_fft.item())
-            history['mom_x'].append(total_mom_x.item())
-            history['mom_y'].append(total_mom_y.item())
-            history['mom_z'].append(total_mom_z.item())
-            history['ene'].append(total_ene.item())
+            history['loss'].append(loss.item())
+            history['ic'].append(ic.item())
+            history['pde'].append(pde.item())
+            history['norm'].append(norm.item())
+            history['ana'].append(ana.item())
+            history['fft'].append(fft.item())
+            history['mom_x'].append(mom_x.item())
+            history['mom_y'].append(mom_y.item())
+            history['mom_z'].append(mom_z.item())
+            history['ene'].append(ene.item())
 
             # ========== 实时更新图像 ==========
             for i, key in enumerate(keys):
@@ -387,10 +396,10 @@ class Solver3DSpherical:
 
             if ep % 1 == 0:
                 print(
-                    f"Epoch {ep}/{epochs}, Batch Size: {current_batch_size}, Loss: {total_loss.item():.4e}, IC: {total_ic.item():.4e}, "
-                    f"PDE: {total_pde.item():.4e}, "
-                    # f" norm: {total_norm.item():.4e}, ana: {total_ana.item():.4e}, fft: {total_fft.item():.4e}, "
-                    f"mom_x: {total_mom_x.item():.4e}, mom_y: {total_mom_y.item():.4e}, mom_z: {total_mom_z.item():.4e}, ene: {total_ene.item():.4e}, "
+                    f"Epoch {ep}/{epochs}, Batch Size: {initial_batch_size}, Loss: {loss.item():.4e}, IC: {ic.item():.4e}, "
+                    f"PDE: {pde.item():.4e}, "
+                    # f" norm: {norm.item():.4e}, ana: {ana.item():.4e}, fft: {fft.item():.4e}, "
+                    f"mom_x: {mom_x.item():.4e}, mom_y: {mom_y.item():.4e}, mom_z: {mom_z.item():.4e}, ene: {ene.item():.4e}, "
                     f"gamma: {self.gamma:.4e}")
 
         plt.ioff()
@@ -865,70 +874,78 @@ def pro_p_ene_plot(solver, k, R0, delta, m, save_dir):
 
 # 主函数示例
 if __name__ == '__main__':
-    B = 5.0 # 边界
+
+    # === 时间戳文件夹 ===
+    now = datetime.now().strftime('%m%d_%H%M')  # 如 0717_1530
+    save_dir = f'./save_model/{now}'
+    os.makedirs(save_dir, exist_ok=True)
+
+    # === 设置空间范围和点数 ===
+    B = 5.0
     t = 1.0
+    Nf_total = 400000  # 生成总点数
+    batch_size = 40000  # 每批 GPU 计算点数
+
+    lb = np.array([-B, -B, -B, 0.0])
+    ub = np.array([B, B, B, t])
+
+    # === 若已生成缓存，加载；否则生成并保存 ===
+    xf_file = os.path.join(save_dir, 'X_f_large.npy')
+    if os.path.exists(xf_file):
+        print(f"Loading precomputed X_f from {xf_file}")
+        X_f = np.load(xf_file)
+    else:
+        print(f"Generating X_f of shape ({Nf_total}, 4)")
+        X_f = lb + (ub - lb) * lhs(4, Nf_total)
+        np.save(xf_file, X_f)
+
     # 其他数据
     k = np.array([1.0, 0, 0.0]) # 初始动量
     R0 = np.array([0.0, 0.0, 0.0]) # 起始坐标（起始位置放置中心0）
     delta = np.array(0.5) # 波包宽度参数
     m = np.array(1.0) # 质量
 
-    lb = np.array([-B, -B, -B, 0.0])
-    # 定义所有训练点数据
-    ub = np.array([B, B, B, t])
-    Nf = 3000
-    X_f = lb + (ub - lb) * lhs(4, Nf)
-    # 定义解析解引导数据
+    # === 解析解引导数据（建议分批计算）===
     U2, V2 = analytic_solution_cartesian(k, R0, X_f, delta)
-
-    # 定义其他时刻 100 个数组归一化数据
-
 
     # 损失函数权重
     lr_ic = 0.1
     lr_pde = 1.0
     lr_norm = 1e-10
     lr_ana = 1e-10
-    lr_fft = 1e-10
+    lr_fft = 0
     lr_mom = 1e3
     lr_ene = 1e2
 
-    n_times = 10  # <<< 新增：时刻个数
-    n_fft = 16  # <<< 新增：FFT 网格边长
+    # n_times = 10  # <<< 新增：时刻个数
+    # n_fft = 16  # <<< 新增：FFT 网格边长
     # n 个均匀时刻
-    time_points = torch.linspace(0, t,
-                                      n_times, device=device)
-    #构建一次性空间网格 (n_fft³)
-    # 空间域边界 [-B, B]³
-    x_lin = torch.linspace(-B, B, n_fft, device=device)
-    y_lin = torch.linspace(-B, B, n_fft, device=device)
-    z_lin = torch.linspace(-B, B, n_fft, device=device)
-
-    # 构造三维笛卡尔网格
-    xx, yy, zz = torch.meshgrid(x_lin, y_lin, z_lin, indexing='ij')
-
-    # 展平成 (N_spatial, 1)
-    x_flat = xx.reshape(-1, 1).float()
-    y_flat = yy.reshape(-1, 1).float()
-    z_flat = zz.reshape(-1, 1).float()
+    # time_points = torch.linspace(0, t, n_times, device=device)
+    # #构建一次性空间网格 (n_fft³)
+    # # 空间域边界 [-B, B]³
+    # x_lin = torch.linspace(-B, B, n_fft, device=device)
+    # y_lin = torch.linspace(-B, B, n_fft, device=device)
+    # z_lin = torch.linspace(-B, B, n_fft, device=device)
+    #
+    # # 构造三维笛卡尔网格
+    # xx, yy, zz = torch.meshgrid(x_lin, y_lin, z_lin, indexing='ij')
+    #
+    # # 展平成 (N_spatial, 1)
+    # x_flat = xx.reshape(-1, 1).float()
+    # y_flat = yy.reshape(-1, 1).float()
+    # z_flat = zz.reshape(-1, 1).float()
     # 学习率
     lr = 1e-3
     epochs = 10
     # 网络配置
     layers = [4, 64, 64, 64, 64, 2]
     model = PINN3DSpherical(layers)
-    solver = Solver3DSpherical(model, B, t, Nf,
+    solver = Solver3DSpherical(model, B, t, Nf_total,
                                X_f, U2, V2,
-                               x_flat, y_flat, z_flat,  n_fft, time_points,
+                               # x_flat, y_flat, z_flat,  n_fft, time_points,
                                k, R0, delta,
                                lr_ic, lr_pde, lr_norm, lr_ana, lr_fft, lr_mom, lr_ene)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-
-
-    # === 时间戳文件夹 ===
-    now = datetime.now().strftime('%m%d_%H%M')  # 如 0717_1530
-    save_dir = f'./save_model/{now}'
-    os.makedirs(save_dir, exist_ok=True)
 
     # model_file = os.path.join(save_dir, 'model.pkl')  # 模型文件路径
     model_file = f'./save_model/0728_1436/model.pkl'
@@ -948,12 +965,11 @@ if __name__ == '__main__':
         start_epoch = checkpoint.get('epoch', 0)
         print(f"Loaded model weights from {model_file}")
 
-    train_flag = False  # 或通过命令行传入参数
-
+    train_flag = True  # 是否训练开关
     if train_flag:
 
         # 训练模型
-        history = solver.train(epochs=epochs, initial_batch_size=3000, optimizer=optimizer, resample_every=10,
+        history = solver.train(epochs=epochs, initial_batch_size=batch_size, optimizer=optimizer, resample_every=10,
                                save_path=save_dir)
 
         torch.save({
@@ -965,8 +981,6 @@ if __name__ == '__main__':
         print(f"Model saved to: {model_file}")
     else:
         solver.model.eval()
-
-
 
     # 测试点 只看 z=0; t=0.5截面
     predict_and_plot(solver, B, k, R0, delta, save_dir)
@@ -1001,10 +1015,10 @@ if __name__ == '__main__':
         f.write(f"lr_mom: {lr_mom}\n")
         f.write(f"lr_ene: {lr_ene}\n")
         f.write("\n=== FFT / 网格参数 ===\n")
-        f.write(f"n_fft: {n_fft}\n")
-        f.write(f"n_times: {n_times}\n")
-        f.write(f"time_points: {time_points.cpu().numpy()}\n")
-        f.write(f"x_flat.shape: {x_flat.shape}\n")
+        # f.write(f"n_fft: {n_fft}\n")
+        # f.write(f"n_times: {n_times}\n")
+        # f.write(f"time_points: {time_points.cpu().numpy()}\n")
+        # f.write(f"x_flat.shape: {x_flat.shape}\n")
         f.write("\n=== 其它参数 ===\n")
         # f.write(f"n_per_dim: {n_per_dim}\n")  # 每维取几个点（4维空间中每维取10个点 -> 共 10^4 = 10000 个点）
         f.write(f"X_f.shape: {X_f.shape}\n")
