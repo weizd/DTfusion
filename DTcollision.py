@@ -185,7 +185,8 @@ class Solver3DSpherical:
         alpha: gate steepness
         """
         t_norm = t / self.t
-        return 0.5 * (1.0 - torch.tanh(alpha * (t_norm - self.gamma)))
+        causal_gate = 0.5 * (1.0 - torch.tanh(alpha * (t_norm - self.gamma)))
+        return 1.0
 
     def update_gamma(self, loss, eta=0.01, epsilon=10.0):
         """
@@ -193,7 +194,8 @@ class Solver3DSpherical:
         loss: current PDE causal loss (float)
         """
         loss_np = loss.detach().cpu().numpy()
-        return self.gamma + eta * np.exp(-epsilon * loss_np)
+        update_gamma = self.gamma + eta * np.exp(-epsilon * loss_np)
+        return 1.0
 
     def loss(self, batch_data):
         mse_energy = []
@@ -307,7 +309,7 @@ class Solver3DSpherical:
                 mse_momentum_x_total, mse_momentum_y_total, mse_momentum_z_total, mse_energy_total)
 
     def train(self, epochs, initial_batch_size, optimizer, resample_every, save_path):
-        scheduler = ReduceLROnPlateau(optimizer, factor=0.5, patience=100)
+        # scheduler = ReduceLROnPlateau(optimizer, factor=0.5, patience=100)
         history = {'loss': [], 'ic': [], 'pde': [], 'norm': [], 'ana': [], 'fft': [], 'mom_x': [], 'mom_y': [], 'mom_z': [], 'ene': []}
         start = time()
 
@@ -372,7 +374,25 @@ class Solver3DSpherical:
             #     loss.backward(retain_graph=False)
             #     optimizer.step()
 
-            scheduler.step(loss.item())
+            # scheduler.step(loss.item())
+            # 每隔 1000 轮自动调整权重
+            if ep % 1000 == 0:
+                eps = 1e-15 # 避免除以 0 的稳定项
+                ratio_ic = pde.item() / (ic.item() + eps)
+                ratio_mx = pde.item() / (mom_x.item() + eps)
+                ratio_my = pde.item() / (mom_y.item() + eps)
+                ratio_mz = pde.item() / (mom_z.item() + eps)
+                ratio_ene = pde.item() / (ene.item() + eps)
+
+                self.lr_ic *= ratio_ic
+                self.lr_x_mom *= ratio_mx
+                self.lr_y_mom *= ratio_my
+                self.lr_z_mom *= ratio_mz
+                self.lr_ene *= ratio_ene
+                print(f"[Adjust Weights @ Epoch {ep}], "
+                      f"lr_ic  -> {self.lr_ic:.3e}, "
+                      f"lr_mom -> {self.lr_x_mom:.3e}, {self.lr_y_mom:.3e}, {self.lr_z_mom:.3e}, "
+                      f"lr_ene -> {self.lr_ene:.3e}")
 
             # 记录历史
             history['loss'].append(loss.item())
@@ -826,7 +846,7 @@ def pro_p_ene_plot(solver, k, R0, delta, m, save_dir):
     plt.ylabel("% Change")
     plt.tight_layout()
     plt.savefig(os.path.join(save_dir, f'Probability_Energy.png'))
-    plt.show()
+    # plt.show()
 
 
     plt.figure(figsize=(8, 4))
@@ -835,7 +855,7 @@ def pro_p_ene_plot(solver, k, R0, delta, m, save_dir):
     plt.ylabel("% Change")
     plt.tight_layout()
     plt.savefig(os.path.join(save_dir, f'Probability_Energy.png'))
-    plt.show()
+    # plt.show()
 
 
     plt.figure(figsize=(8, 4))
@@ -843,7 +863,7 @@ def pro_p_ene_plot(solver, k, R0, delta, m, save_dir):
     plt.title("overlap vs Time")
     plt.tight_layout()
     plt.savefig(os.path.join(save_dir, f'overlap.png'))
-    plt.show()
+    # plt.show()
 
 
     plt.figure(figsize=(8, 4))
@@ -851,7 +871,7 @@ def pro_p_ene_plot(solver, k, R0, delta, m, save_dir):
     plt.title("x_expectation vs Time")
     plt.tight_layout()
     plt.savefig(os.path.join(save_dir, f'x_expectation.png'))
-    plt.show()
+    # plt.show()
 
 
     plt.figure(figsize=(15, 4))
@@ -868,7 +888,7 @@ def pro_p_ene_plot(solver, k, R0, delta, m, save_dir):
     plt.title("Momentum Pz (% Change)")
     plt.tight_layout()
     plt.savefig(os.path.join(save_dir, f'Momentum.png'))
-    plt.show()
+    # plt.show()
 
 
 
@@ -883,8 +903,8 @@ if __name__ == '__main__':
     # === 设置空间范围和点数 ===
     B = 5.0
     t = 1.0
-    Nf_total = 400000  # 生成总点数
-    batch_size = 40000  # 每批 GPU 计算点数
+    Nf_total = 40000  # 生成总点数
+    batch_size = 4000  # 每批 GPU 计算点数
 
     lb = np.array([-B, -B, -B, 0.0])
     ub = np.array([B, B, B, t])
@@ -947,14 +967,14 @@ if __name__ == '__main__':
                                lr_ic, lr_pde, lr_norm, lr_ana, lr_fft, lr_mom, lr_ene)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
-    # model_file = os.path.join(save_dir, 'model.pkl')  # 模型文件路径
-    model_file = f'./save_model/0728_1436/model.pkl'
+    model_file = os.path.join(save_dir, 'model.pkl')  # 模型文件路径
+    model_file_old = f'./save_model/0728_1436/model.pkl$$$'
     param_txt_path = os.path.join(save_dir, 'params.txt')  # 参数记录文件路径
 
     # 如果已有模型，加载
     start_epoch = 0
-    if os.path.exists(model_file):
-        checkpoint = torch.load(model_file)
+    if os.path.exists(model_file_old):
+        checkpoint = torch.load(model_file_old)
         model.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
 
@@ -963,13 +983,13 @@ if __name__ == '__main__':
             param_group['lr'] = lr
 
         start_epoch = checkpoint.get('epoch', 0)
-        print(f"Loaded model weights from {model_file}")
+        print(f"Loaded model weights from {model_file_old}")
 
     train_flag = True  # 是否训练开关
     if train_flag:
 
         # 训练模型
-        history = solver.train(epochs=epochs, initial_batch_size=batch_size, optimizer=optimizer, resample_every=10,
+        history = solver.train(epochs=epochs, initial_batch_size=batch_size, optimizer=optimizer, resample_every=1e10,
                                save_path=save_dir)
 
         torch.save({
